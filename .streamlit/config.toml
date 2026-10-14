@@ -1,0 +1,9 @@
+   [server]
+   port = 8502
+
+   [theme]
+   base = "light"
+   primaryColor = "#2563eb"
+
+   [client]
+   toolbarMode = "minimal"
