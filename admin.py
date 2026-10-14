@@ -19,6 +19,8 @@ import workflow as wf
 MENU = ["📊 대시보드", "📋 자산대장", "➕ 자산 등록", "✅ 결재함", "🔍 재물조사", "📉 감가상각·결산",
         "♻️ 처분 검토·유휴", "🗑 폐기·처분 자산", "⚙️ 설정"]
 LIVE_REFRESH_SECONDS = 10
+# Streamlit Community Cloud에서는 앱이 /mount/src 아래에서 실행됩니다 (무료 서버는 메모리가 작음).
+ON_CLOUD = str(d.BASE_DIR).startswith("/mount/src")
 
 
 def live_refresh_fragment(func):
@@ -612,11 +614,21 @@ def settings(actor: str):
                 ui.flash(f"예시 자산 {n:,}개와 관련 요청·조사·이력을 삭제했습니다.")
                 st.rerun()
     else:
-        c1.caption("보유 자산 약 2만 개(현장 4곳), 폐기·매각·기증·경매·망실로 처분된 자산 약 18만 개와 처분 요청서, "
-                   "진행 중인 구매·이동·사고·처분 요청과 재물조사를 만듭니다. 모든 예시 자산 비고에 [예시]가 붙습니다. 20~40초 걸립니다.")
+        sizes = {"작게 (체험용)": (2000, 10000), "크게 (대량 데이터 확인용)": (20500, 180000)}
+        if ON_CLOUD:
+            size = "작게 (체험용)"
+            c1.caption("인터넷 서버(Streamlit Cloud)에서는 메모리가 작아 체험용 크기로 만듭니다. "
+                       "대량 데이터(보유 2만 · 처분 18만)는 내 컴퓨터에서 실행할 때 만들 수 있습니다.")
+        else:
+            size = c1.radio("예시 데이터 크기", list(sizes), index=1, horizontal=True, key="sample-size")
+        active_n, closed_n = sizes[size]
+        c1.caption(f"보유 자산 {active_n:,}개(현장 4곳), 폐기·매각·기증·경매·망실로 처분된 자산 {closed_n:,}개와 처분 요청서, "
+                   "진행 중인 구매·이동·사고·처분 요청과 재물조사를 만듭니다. 모든 예시 자산 비고에 [예시]가 붙습니다."
+                   + (" 20~40초 걸립니다." if closed_n > 50000 else " 몇 초면 끝납니다."))
         if c2.button("🧪 예시 데이터 만들기", width="stretch", type="primary"):
             bar = st.progress(0.0, text="준비하는 중")
-            result = ui.run_action(d.create_sample_data, actor, progress=lambda p, t: bar.progress(min(1.0, p), text=t))
+            result = ui.run_action(d.create_sample_data, actor, active_count=active_n, closed_count=closed_n,
+                                   progress=lambda p, t: bar.progress(min(1.0, p), text=t))
             if result:
                 ui.flash(f"예시 데이터를 만들었습니다: 보유 자산 {result['active']:,}개 · 처분 자산 {result['closed']:,}개 · 처분 요청서 {result['dsp']:,}건")
                 st.rerun()
