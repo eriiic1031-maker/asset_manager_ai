@@ -36,6 +36,13 @@ def inject_css():
         .kpi-card.warn {border-color:#fcd34d;background:#fffbeb;}
         .kpi-card.crit {border-color:#fca5a5;background:#fef2f2;}
         .kpi-card.ok {border-color:#86efac;background:#f0fdf4;}
+        [class*="st-key-clickcard-"] {position:relative;}
+        [class*="st-key-clickcard-"] .kpi-card {transition:transform .12s, box-shadow .12s; cursor:pointer;}
+        [class*="st-key-clickcard-"]:hover .kpi-card {transform:translateY(-2px); box-shadow:0 6px 18px rgba(37,99,235,.15);}
+        .kpi-card.selected {outline:2px solid #2563eb; outline-offset:-1px;}
+        [class*="st-key-cardbtn-"] {position:absolute !important; inset:0; z-index:5; margin:0 !important;}
+        [class*="st-key-cardbtn-"] div, [class*="st-key-cardbtn-"] button {width:100% !important; height:100% !important;}
+        [class*="st-key-cardbtn-"] button {opacity:0; cursor:pointer; min-height:0;}
         .kpi-title {font-size:14px;color:#64748b;font-weight:700;}
         .kpi-value {font-size:clamp(20px,2.1vw,28px);font-weight:800;margin-top:6px;color:#111827;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
         .kpi-value small {font-size:15px;color:#64748b;font-weight:700;margin-left:2px;}
@@ -116,6 +123,13 @@ def short_won(value) -> str:
 def fmt_date(value) -> str:
     v = d.to_date(value)
     return v.strftime("%Y-%m-%d") if v else "-"
+
+
+def click_kpi(key: str, title: str, value, caption: str = "", tone: str = "", unit: str = "", selected: bool = False) -> bool:
+    """카드 전체가 버튼인 KPI. 누르면 True."""
+    with st.container(key=f"clickcard-{key}"):
+        kpi(title, value, caption, (tone + (" selected" if selected else "")).strip(), unit)
+        return st.button(f"{title} 열기", key=f"cardbtn-{key}", width="stretch")
 
 
 def kpi(title: str, value, caption: str = "", tone: str = "", unit: str = ""):

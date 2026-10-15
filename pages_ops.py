@@ -202,7 +202,7 @@ MT_GUIDE = """
 
 1. **점검 계획 등록** — 소방설비·크레인·계측기처럼 정기적으로 점검·검사·검교정을 받아야 하는 자산에
    '➕ 점검 계획 등록'으로 주기(예: 12개월)와 최근 점검일을 넣습니다. 다음 점검일이 자동으로 정해집니다.
-2. **지연·임박 확인** — 위 카드의 **[목록 보기]** 를 누르면 처리할 목록이 나옵니다. 사이드바 🔔 알림에도 뜹니다.
+2. **지연·임박 확인** — 위 **카드(점검 지연·임박·수리 중·보증 만료)를 누르면** 처리할 목록이 나옵니다. 사이드바 🔔 알림에도 뜹니다.
 3. **점검하고 완료 기록** — 점검을 마치면 그 줄의 **✅ 점검 완료** 를 눌러 점검일·결과·비용을 넣습니다.
    다음 점검일이 주기만큼 자동으로 넘어가 목록에서 빠집니다. 여러 건을 같은 날 정상 완료했다면 체크 후 **일괄 완료**.
    업체 일정 등으로 미뤄야 하면 **📅 일정 변경** (사유가 이력에 남습니다).
@@ -405,21 +405,18 @@ def maint_page(u: dict):
              ("soon", "점검 임박", len(soon), f"{days}일 안 예정", "warn" if soon else "", "건"),
              ("fix", "수리 중", len(fixing), "수리 완료 기록 대기", "warn" if fixing else "", "개"),
              ("warr", "보증 만료 임박", len(warr), f"{days}일 안", "warn" if warr else "", "개")]
-    cols = st.columns(5)
-    for col, (v, title, n, cap, tone, unit) in zip(cols, cards):
-        with col:
-            ui.kpi(title, n, cap, tone, unit)
-            if st.button("목록 보기 ›", key=f"mt-card-{v}", width="stretch", type="primary" if st.session_state.get("mt-view") == v else "secondary"):
-                st.session_state["mt-view"] = v
-                st.rerun()
-    with cols[4]:
-        ui.kpi(f"{d.today().year}년 점검·수리비", ui.short_won(year_cost), ui.won(year_cost), unit="원")
-        if st.button("기록 보기 ›", key="mt-card-logs", width="stretch"):
-            st.session_state["mt-view"] = "logs"
-            st.rerun()
-
     if st.session_state.get("mt-view") not in views:
         st.session_state["mt-view"] = "late" if late else "soon" if soon else "plans"
+    cols = st.columns(5)
+    current = st.session_state.get("mt-view")
+    cards.append(("logs", f"{d.today().year}년 점검·수리비", ui.short_won(year_cost), ui.won(year_cost), "", "원"))
+    for col, (v, title, n, cap, tone, unit) in zip(cols, cards):
+        with col:
+            if ui.click_kpi(f"mt-{v}", title, n, cap, tone, unit, selected=current == v):
+                st.session_state["mt-view"] = v
+                st.rerun()
+    st.caption("카드를 누르면 아래에 해당 목록이 나옵니다.")
+
     view = st.segmented_control("보기", list(views), format_func=views.get, key="mt-view", label_visibility="collapsed") or "late"
 
     if view == "late":
