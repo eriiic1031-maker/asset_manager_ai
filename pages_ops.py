@@ -636,26 +636,168 @@ def budget_page(u: dict):
 # =========================================================
 # 🔔 알림
 # =========================================================
+def all_alerts(u: dict) -> list[dict]:
+    """지금 사용자의 알림 전체 (결재·대여 대기는 한 건씩)."""
+    return ops.alerts_for(u, wf.pending_for(u), rentals=wf.pending_rentals(u))
+
+
+@st.dialog("✅ 점검 완료 기록", width="large")
+def dlg_plan_done(pno: str, u: dict):
+    p = d.lookup("maint_plans", pno)
+    a = d.get_asset(p["태그번호"]) if p else None
+    if not p or not a:
+        st.error("점검 계획을 찾을 수 없습니다.")
+        return
+    st.markdown(f"**{html.escape(p['점검명'])}** · {html.escape(a['품명'])} ({a['태그번호']}) · {a['현장']} · "
+                f"예정일 {ui.fmt_date(p['다음점검일'])}")
+    if not wf.manages(u, a["현장"]):
+        st.info(f"{a['현장']} 담당자가 기록합니다.")
+        return
+    vendors = [""] + ops.vendor_names()
+    with st.form(f"dlg-mt-{pno}"):
+        c1, c2, c3 = st.columns(3)
+        when = c1.date_input("점검일", value=d.today())
+        result = c2.selectbox("결과", ["정상", "조치 필요", "불합격"])
+        cost = c3.number_input("비용(원)", min_value=0, step=10000)
+        content = st.text_input("내용", value=p["점검명"])
+        vendor = st.selectbox("업체", vendors, index=vendors.index(p["담당업체"]) if p["담당업체"] in vendors else 0)
+        if st.form_submit_button("✅ 점검 완료 기록", type="primary", width="stretch"):
+            if ui.run_action(d.add_maint_log, {"태그번호": p["태그번호"], "일자": when, "구분": p["구분"], "내용": content,
+                                               "업체": vendor, "비용": cost, "결과": result, "계획번호": pno},
+                             auth.actor(u), success="점검 완료를 기록했습니다. 다음 점검일이 갱신되었습니다."):
+                st.rerun()
+
+
+@st.dialog("👥 퇴사 자산 회수", width="large")
+def dlg_return(rno: str, u: dict):
+    r = d.lookup("returns", rno)
+    if not r:
+        st.error("퇴사 회수 건을 찾을 수 없습니다.")
+        return
+    items = ops.return_items(rno)
+    left = [i for i in items if i["결과"] == "미처리"]
+    st.markdown(f"**{rno}** · {html.escape(r['이름'])} ({r['현장']} {r['부서']}) · 퇴사일 {ui.fmt_date(r['퇴사일'])} · "
+                f"{len(items) - len(left)}/{len(items)} 처리")
+    if items:
+        st.dataframe(pd.DataFrame(items)[["태그번호", "품명", "결과", "인계자", "메모"]], hide_index=True, width="stretch")
+    if not left:
+        st.success("모든 자산을 처리했습니다.")
+        return
+    if not wf.manages(u, r["현장"]):
+        st.info(f"{r['현장']} 담당자가 처리합니다.")
+        return
+    with st.form(f"dlg-ret-{rno}"):
+        c1, c2 = st.columns([2, 1])
+        tag = c1.selectbox("자산", [i["태그번호"] for i in left],
+                           format_func=lambda t: next(f"{t} · {i['품명']}" for i in left if i["태그번호"] == t))
+        result = c2.radio("처리", ["회수", "인계", "분실"], horizontal=True)
+        c1, c2 = st.columns(2)
+        to = c1.text_input("인계받을 직원 (인계일 때)")
+        memo = c2.text_input("메모", placeholder="예: 충전기 포함 회수")
+        if st.form_submit_button("처리", type="primary", width="stretch"):
+            done = ui.run_action(ops.process_return_item, rno, tag, result, to, memo, auth.actor(u))
+            if done is not None:
+                ui.flash(f"{tag} {result} 처리했습니다." + (" 퇴사 회수를 모두 마쳤습니다." if len(left) == 1 else ""))
+                st.rerun()
+
+
+RENTAL_LABELS = {"r_approve": "✅ 승인", "r_reject": "❌ 반려", "r_handout": "📤 인계", "r_return": "📥 반납 확인"}
+
+
+def alert_actions(a: dict, u: dict, key: str):
+    """알림 한 건의 처리 버튼 (누르면 그 자리에서 처리 창이 열립니다)."""
+    kind, *ref = a["대상"]
+    btns = []  # (라벨, 실행 함수, 강조 여부)
+    if kind == "req":
+        rkind, no = ref
+        rec = d.get_request(rkind, no)
+        for act in (wf.actions_for(rkind, rec, u) if rec else []):
+            btns.append((wf.ACTION_LABELS[act], lambda act=act: wf.open_action(rkind, act, no, u), act != "reject"))
+        if rec:
+            btns.append(("📄 상세", lambda: wf.dlg_request_detail(rkind, no, u), False))
+    elif kind == "rental":
+        r = d.lookup("rentals", ref[0])
+        for act in (wf.rental_actions(r, u) if r else []):
+            btns.append((RENTAL_LABELS[act], lambda act=act: dlg_rental(ref[0], act, u), act != "r_reject"))
+    elif kind == "plan":
+        btns.append(("✅ 점검 완료", lambda: dlg_plan_done(ref[0], u), True))
+    elif kind == "return":
+        btns.append(("📥 회수 처리", lambda: dlg_return(ref[0], u), True))
+    elif kind == "asset":
+        btns.append(("🔍 자산 보기", lambda: wf.asset_dialog(ref[0], u), False))
+    elif ref and ref[0] in ui.PAGES:
+        btns.append(("➡️ 바로가기", lambda: ui.goto(ref[0]), False))
+    if not btns:
+        st.caption("처리됨")
+        return
+    for i, (col, (label, fn, primary)) in enumerate(zip(st.columns(len(btns)), btns)):
+        if col.button(label, key=f"{key}-{i}", width="stretch", type="primary" if primary else "secondary"):
+            fn()
+
+
+def alert_center(alerts: list[dict], u: dict, key: str, per_group: int = 30, expand_first: bool = False):
+    """알림을 종류별로 묶어 건수와 함께 보여 줍니다. 종류를 펼치면 한 건씩 처리 버튼이 나옵니다."""
+    if not alerts:
+        st.success("확인할 알림이 없습니다.")
+        return
+    groups: dict[str, list[dict]] = {}
+    for a in alerts:
+        groups.setdefault(a["분류"], []).append(a)
+    order = {"crit": 0, "warn": 1, "info": 2}
+    names = sorted(groups, key=lambda g: (min(order[a["심각도"]] for a in groups[g]), -len(groups[g])))
+    for gi, g in enumerate(names):
+        rows = groups[g]
+        crit = sum(1 for a in rows if a["심각도"] == "crit")
+        icon = ui.ALERT_ICON[min((a["심각도"] for a in rows), key=order.get)]
+        with st.expander(f"{icon} **{g}** · {len(rows)}건" + (f" (긴급 {crit})" if crit else ""),
+                         expanded=expand_first and gi == 0 and len(names) > 1 or len(names) == 1):
+            for i, a in enumerate(rows[:per_group]):
+                c1, c2 = st.columns([3, 2.4], vertical_alignment="center")
+                c1.markdown(f"{ui.ALERT_ICON[a['심각도']]} **{html.escape(_clean(a['제목']))}**"
+                            + (f"  \n<span class='small-muted'>{html.escape(_clean(str(a['내용'])))}</span>" if a["내용"] else ""),
+                            unsafe_allow_html=True)
+                with c2:
+                    alert_actions(a, u, f"{key}-{g}-{i}")
+            if len(rows) > per_group:
+                st.caption(f"… 외 {len(rows) - per_group}건 · 나머지는 해당 메뉴에서 처리하세요.")
+                menu = rows[0].get("메뉴")
+                if menu in ui.PAGES and st.button("➡️ 전체 보기", key=f"{key}-{g}-all"):
+                    ui.goto(menu)
+
+
 def alerts_page(u: dict):
     st.title("🔔 알림")
-    st.caption("결재 대기, 반납 지연, 점검·보증·라이선스·계약 만료, 예산 초과, 경위서 요청, 퇴사 회수처럼 챙겨야 할 일을 모았습니다.")
-    alerts = ops.alerts_for(u, wf.pending_for(u))
-    cats = sorted({a["분류"] for a in alerts})
-    c1, c2 = st.columns([3, 1])
-    pick = c1.multiselect("분류", cats, default=cats, key="al-cats")
-    shown = [a for a in alerts if a["분류"] in pick]
-    c2.metric("알림", f"{len(shown)}건", f"긴급 {sum(1 for a in shown if a['심각도'] == 'crit')}건", delta_color="off")
-    ui.alert_list(shown, key="al", limit=200)
+    st.caption("결재 대기, 반납 지연, 점검·보증·라이선스·계약 만료, 예산 초과, 경위서 요청, 퇴사 회수처럼 챙겨야 할 일을 모았습니다. "
+               "종류를 펼쳐 한 건씩 바로 처리하세요.")
+    alerts = all_alerts(u)
+    crit_n = sum(1 for a in alerts if a["심각도"] == "crit")
+    levels = {"all": f"전체 {len(alerts)}건", "crit": f"🔴 긴급 {crit_n}건"}
+    want = st.session_state.pop("al-want", None)  # 사이드바 '알림'·'긴급' 버튼을 누르고 왔을 때
+    if want is not None:
+        st.session_state["al-level"] = ["all", "crit"][want]
+    if st.session_state.get("al-level") not in levels:
+        st.session_state["al-level"] = "all"
+    c1, c2 = st.columns([2, 3])
+    level = c1.segmented_control("보기", list(levels), format_func=levels.get, key="al-level",
+                                 label_visibility="collapsed") or "all"
+    shown = [a for a in alerts if a["심각도"] == "crit"] if level == "crit" else alerts
+    cats = sorted({a["분류"] for a in shown})
+    pick = c2.multiselect("분류", cats, placeholder="분류 골라 보기 (비우면 전체)", key="al-cats", label_visibility="collapsed")
+    if pick:
+        shown = [a for a in shown if a["분류"] in pick]
+    st.caption("종류를 누르면 목록이 펼쳐지고, 각 건의 버튼으로 바로 처리합니다.")
+    alert_center(shown, u, key="al")
     if u.get("역할") != ADMIN:
         return
     st.divider()
     st.markdown("### 📨 메일 · 메신저로 보내기")
     st.caption("설정의 메일·웹훅(Slack·Teams·Discord)으로 관리자 기준 알림 요약을 보냅니다. 매일 자동으로 보내려면 "
                "Windows 작업 스케줄러에 `python notify.py`를 등록하세요 (README 참고).")
+    summary = ops.alerts_for(u, wf.pending_for(u), detail=False)
     with st.expander("보낼 내용 미리보기"):
-        st.code(ops.digest_text(alerts), language=None)
+        st.code(ops.digest_text(summary), language=None)
     if st.button("📨 지금 보내기", type="primary", disabled=d.ON_CLOUD, help="공개 데모에서는 보내지 않습니다" if d.ON_CLOUD else None):
-        done = ops.send_digest(alerts)
+        done = ops.send_digest(summary)
         if done:
             st.success(" · ".join(done))
         else:

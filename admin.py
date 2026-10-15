@@ -15,6 +15,7 @@ import streamlit as st
 import auth
 import data as d
 import ops
+import pages_ops
 import ui
 import workflow as wf
 from auth import ADMIN, EXEC, FIN, SITE_ROLES
@@ -100,7 +101,7 @@ def dashboard_body(u: dict):
     expired = sum(1 for a in assets if (d.life_remaining_months(a) or 1) <= 0)
     idle = sum(1 for a in assets if a["상태"] == "유휴")
     closed_n = len(d.closed_assets())
-    alerts = ops.alerts_for(u, pending)
+    alerts = pages_ops.all_alerts(u)
     crit = sum(1 for a in alerts if a["심각도"] == "crit")
 
     k = st.columns(4) + st.columns(4)[:3]  # 7개 카드를 두 줄(4 + 3)로
@@ -138,7 +139,7 @@ def dashboard_body(u: dict):
     c1, c2 = st.columns([1.3, 1])
     with c1:
         st.markdown("## 🔔 알림")
-        ui.alert_list(alerts, key="dash-alert", limit=8)
+        pages_ops.alert_center(alerts, u, key="dash-alert", per_group=10, expand_first=False)
         ui.page_button("🔔 알림 전체 보기", "alerts", key="dash-alerts-all")
     with c2:
         st.markdown(f"## 💰 {d.today().year}년 예산")

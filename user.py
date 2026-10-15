@@ -33,7 +33,8 @@ def site_home(u: dict):
     pending = wf.pending_for(u)
     rentals = wf.pending_rentals(u)
     todo = [(k, r) for k in d.REQUEST_TABLES for r in pending[k]]
-    alerts = ops.alerts_for(u, pending)
+    import pages_ops
+    alerts = pages_ops.all_alerts(u)
 
     k = st.columns(6)
     with k[0]: ui.kpi("보유 자산", f"{len(mine):,}", site, unit="개")
@@ -49,14 +50,13 @@ def site_home(u: dict):
         for kind, rec in todo[:30]:
             wf.render_request_card(kind, rec, u, key="todo")
         if rentals:
-            import pages_ops
             pages_ops.rental_cards(rentals, u, key="todo-rt")
     else:
         st.success("지금 처리할 결재·인수·검수가 없습니다.")
 
     tabs = st.tabs([f"🔔 알림 ({len(alerts)})", "📋 신청 현황", "🗑 처분 이력"])
     with tabs[0]:
-        ui.alert_list(alerts, key="site-alert", limit=30)
+        pages_ops.alert_center(alerts, u, key="site-alert")
     with tabs[1]:
         st.caption("우리 현장과 관련된 모든 요청입니다. 처리할 차례가 되면 위 '처리할 일'에 나타납니다.")
         icons = {"pr": "🛒", "move": "🔄", "inc": "⚠️", "dsp": "🗑"}

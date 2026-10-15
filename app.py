@@ -20,7 +20,6 @@ st.set_page_config(page_title="자산관리 AI", page_icon="🏷️", layout="wi
 import admin  # noqa: E402
 import auth  # noqa: E402
 import data as d  # noqa: E402
-import ops  # noqa: E402
 import pages_fin  # noqa: E402
 import pages_ops  # noqa: E402
 import ui  # noqa: E402
@@ -92,17 +91,26 @@ def build_pages(u: dict) -> dict[str, list]:
     return sections
 
 
-def sidebar(u: dict):
+def sidebar(u: dict, sections: dict[str, list]):
+    """왼쪽 사이드바: 맨 위 사용자 → 알림·긴급 → 메뉴 → 데이터 요약."""
     with st.sidebar:
-        st.divider()
         auth.sidebar_box(u)
-        alerts = ops.alerts_for(u, wf.pending_for(u))
+        alerts = pages_ops.all_alerts(u)
         crit = sum(1 for a in alerts if a["심각도"] == "crit")
-        if alerts:
-            st.caption(f"🔔 알림 {len(alerts)}건" + (f" · 🔴 긴급 {crit}건" if crit else ""))
+        c1, c2 = st.columns(2)
+        if c1.button(f"🔔 알림 {len(alerts)}", key="sb-alerts", width="stretch", help="알림 전체 목록을 열고 바로 처리합니다"):
+            st.session_state["al-want"] = 0
+            ui.goto("alerts")
+        if c2.button(f"🔴 긴급 {crit}", key="sb-crit", width="stretch", type="primary" if crit else "secondary",
+                     help="지연·초과처럼 급한 것만 모아 봅니다"):
+            st.session_state["al-want"] = 1
+            ui.goto("alerts")
+        for section, pages in sections.items():
+            st.markdown(f"<div class='nav-section'>{section}</div>", unsafe_allow_html=True)
+            for page in pages:
+                st.page_link(page)
         st.divider()
-        assets = d.active_assets()
-        st.caption(f"보유 자산 {len(assets):,}개 · 폐기·처분 누계 {len(d.closed_assets()):,}개")
+        st.caption(f"보유 자산 {len(d.active_assets()):,}개 · 폐기·처분 누계 {len(d.closed_assets()):,}개")
         st.caption(f"데이터: {d.DATA_DIR.name}/{d.DB_FILE.name}")
 
 
@@ -147,8 +155,9 @@ def main():
         auth.choose_screen()
         return
 
-    nav = st.navigation(build_pages(u))
-    sidebar(u)
+    sections = build_pages(u)
+    nav = st.navigation(sections, position="hidden")  # 메뉴는 sidebar()가 사용자 정보 아래에 직접 그립니다
+    sidebar(u, sections)
     demo_banner()
     ui.show_flash()
     nav.run()

@@ -26,7 +26,7 @@ def admin_view() -> dict:
 
 def collect() -> list[dict]:
     pending = {k: [r for r in d.get_requests(k) if d.is_open(k, r)] for k in d.REQUEST_TABLES}
-    return ops.alerts_for(admin_view(), pending)
+    return ops.alerts_for(admin_view(), pending, detail=False)
 
 
 def main(argv=None) -> int:

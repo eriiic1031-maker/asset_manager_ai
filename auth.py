@@ -199,12 +199,14 @@ def choose_screen(compact: bool = False):
 
 def sidebar_box(u: dict):
     """사이드바: 지금 사용자 + 다른 사람으로 바꾸기."""
-    st.markdown(f"**{label(u)}**" + (f"  \n{u['부서']}" if u.get("부서") else ""))
     users = get_users(True)
     ids = [x["아이디"] for x in users]
     names = {x["아이디"]: label(x) for x in users}
-    pick = st.selectbox("사용자 바꾸기", ids, index=ids.index(u["아이디"]) if u["아이디"] in ids else 0,
-                        format_func=lambda x: names.get(x, x), key="sidebar-user-pick")
+    with st.container(border=True):
+        st.markdown(f"**{label(u)}**" + (f"  \n<span class='small-muted'>{u['부서']}</span>" if u.get("부서") else ""),
+                    unsafe_allow_html=True)
+        pick = st.selectbox("사용자 바꾸기", ids, index=ids.index(u["아이디"]) if u["아이디"] in ids else 0,
+                            format_func=lambda x: names.get(x, x), key="sidebar-user-pick")
     if pick != u["아이디"]:
         for k in list(st.session_state.keys()):
             del st.session_state[k]  # 다른 사람의 화면 상태(선택·필터)가 섞이지 않게 비웁니다

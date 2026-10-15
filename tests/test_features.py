@@ -172,3 +172,16 @@ def test_users_without_password(store):
         auth.save_user({"활성": "N"}, "관리자", admin["아이디"])
     auth.save_user({"위원": "Y"}, "관리자", uid)
     assert [m["아이디"] for m in auth.committee_members()] == [admin["아이디"], uid]
+
+
+def test_alerts_point_to_where_they_are_handled(store, one_laptop):
+    import workflow as wf
+    store.update_asset(one_laptop, {"보증만료일": store.today() + timedelta(days=5)}, "관리자")
+    no = store.create_purchase_request({"현장": "평택", "품명": "장비", "계정과목": "공기구비품", "수량": 1,
+                                        "예상단가": 100_000, "구매사유": "필요"}, "요청자")
+    u = {"아이디": "admin", "이름": "관리자", "역할": ops.ADMIN, "현장": "", "위원": "Y"}
+    alerts = ops.alerts_for(u, wf.pending_for(u))
+    assert ("req", "pr", no) in [a["대상"] for a in alerts]          # 결재 대기는 한 건씩 바로 처리
+    assert ("asset", one_laptop) in [a["대상"] for a in alerts]
+    summary = ops.alerts_for(u, wf.pending_for(u), detail=False)     # 메일 요약은 종류별 한 줄
+    assert any(a["분류"] == "결재" and "1건" in a["제목"] for a in summary)

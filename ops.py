@@ -844,32 +844,55 @@ def top_repairs(limit: int = 15) -> list[dict]:
 # =========================================================
 # 알림
 # =========================================================
-def alerts_for(user: dict, pending: dict | None = None) -> list[dict]:
-    """지금 사용자에게 보여 줄 알림. 심각도: crit(지연) / warn(임박·대기) / info."""
+def alerts_for(user: dict, pending: dict | None = None, detail: bool = True, rentals: list[dict] | None = None) -> list[dict]:
+    """지금 사용자에게 보여 줄 알림. 심각도: crit(지연) / warn(임박·대기) / info.
+
+    각 알림의 '대상'은 바로 처리할 곳입니다: ("req", 종류, 요청번호) · ("rental", 대여번호) · ("plan", 계획번호)
+    · ("asset", 태그번호) · ("return", 회수번호) · ("page", 메뉴키).
+    detail=False면 결재 대기를 종류별 건수 한 줄로 묶습니다(메일 요약용).
+    """
     role, site = user.get("역할"), user.get("현장") or None
     scope = site if role in SITE_ROLES else None
     out = []
 
-    def add(level, cat, title, detail="", menu=""):
-        out.append({"심각도": level, "분류": cat, "제목": title, "내용": detail, "메뉴": menu})
+    def add(level, cat, title, detail="", menu="", target=None):
+        out.append({"심각도": level, "분류": cat, "제목": title, "내용": detail, "메뉴": menu,
+                    "대상": target or ("page", menu)})
 
-    if pending:
-        for kind, rows in pending.items():
-            if rows:
-                add("warn", "결재", f"{d.KIND_NAMES.get(kind, kind)} {len(rows)}건이 내 처리를 기다립니다", menu="inbox")
+    for kind, rows in (pending or {}).items():
+        if not rows:
+            continue
+        name = d.KIND_NAMES.get(kind, kind)
+        if not detail:
+            add("warn", "결재", f"{name} {len(rows)}건이 처리를 기다립니다", menu="inbox")
+            continue
+        for r in rows:
+            if kind == "inc" and r["상태"] == "경위요청":
+                add("crit", "경위서", f"경위서 작성 요청: {r.get('품명', '')}", f"{r['요청번호']} · {r.get('태그번호', '')} · {r.get('현장', '')}",
+                    "inbox", ("req", kind, r["요청번호"]))
+                continue
+            title = r.get("품명", "") or r.get("태그번호", "")
+            add("warn", f"결재 · {name}", f"{name} {r['상태']}: {str(title)[:40]}",
+                f"{r['요청번호']} · {r.get('현장') or r.get('보내는 현장', '')} · {r.get('요청일시', '')}",
+                "inbox", ("req", kind, r["요청번호"]))
+    for r in rentals or []:
+        add("warn", "대여 신청", f"대여 {'승인' if r['상태'] == '신청' else '인계'} 대기: {r['품명']} ({r['신청자명']})",
+            f"{r['대여번호']} · {r['시작일']} ~ {r['반납예정일']}", "rental", ("rental", r["대여번호"]))
     if role in (ADMIN,) + SITE_ROLES:
         for r in overdue_rentals(scope):
-            add("crit", "대여", f"반납 지연: {r['품명']} ({r['신청자명']})", f"반납 예정 {r['반납예정일']} · {r['대여번호']}", "rental")
+            add("crit", "대여", f"반납 지연: {r['품명']} ({r['신청자명']})", f"반납 예정 {r['반납예정일']} · {r['대여번호']}", "rental",
+                ("rental", r["대여번호"]))
         for p in plans_due(site=scope):
             add("crit" if p["상태"] == "지연" else "warn", "점검",
                 f"{p['구분']} {'지연' if p['상태'] == '지연' else '임박'}: {p['품명']} · {p['점검명']}",
-                f"{p['태그번호']} · 예정일 {p['다음점검일']} ({p['남은 일수']:+d}일)", "maint")
+                f"{p['태그번호']} · 예정일 {p['다음점검일']} ({p['남은 일수']:+d}일)", "maint", ("plan", p["계획번호"]))
         for a in warranty_expiring(site=scope)[:30]:
-            add("info", "보증", f"보증 만료 임박: {a['품명']}", f"{a['태그번호']} · {a['보증만료일']}", "maint")
+            add("info", "보증", f"보증 만료 임박: {a['품명']}", f"{a['태그번호']} · {a['보증만료일']}", "maint", ("asset", a["태그번호"]))
         for r in get_returns(scope):
             if r["상태"] == "진행중":
                 left = len([i for i in return_items(r["회수번호"]) if i["결과"] == "미처리"])
-                add("warn", "퇴사 회수", f"{r['이름']} 퇴사 회수 미처리 {left}건", f"퇴사일 {r['퇴사일']}", "people")
+                add("warn", "퇴사 회수", f"{r['이름']} 퇴사 회수 미처리 {left}건", f"{r['회수번호']} · 퇴사일 {r['퇴사일']}", "people",
+                    ("return", r["회수번호"]))
     if role in (ADMIN, FIN):
         for x in licenses_expiring():
             add("crit" if x["만료까지(일)"] < 0 else "warn", "라이선스", f"갱신 필요: {x['소프트웨어명']}",
@@ -884,16 +907,14 @@ def alerts_for(user: dict, pending: dict | None = None) -> list[dict]:
                 add("crit", "예산", f"{b['현장']} 예산 초과", f"예산 {int(b['예산']):,}원 · 초과 {int(-b['잔액']):,}원", "budget")
             elif b["예산"] and b["집행률(%)"] and b["집행률(%)"] >= 90:
                 add("warn", "예산", f"{b['현장']} 예산 {b['집행률(%)']}% 집행", "", "budget")
-    if role in SITE_ROLES:
-        n = sum(1 for r in d.load("inc") if r["상태"] == "경위요청" and r["현장"] == site)
-        if n:
-            add("crit", "경위서", f"분실 경위서 작성 요청 {n}건", "재물조사 미발견·퇴사자 미반납 자산", "inbox")
     my_rentals = [r for r in d.load("rentals") if r["신청자"] == user.get("아이디") and r["상태"] == "대여중"]
     for r in my_rentals:
         days = (r["반납예정일"] - d.today()).days if r["반납예정일"] else 0
         if days <= 1:
+            if any(x["대상"] == ("rental", r["대여번호"]) for x in out):
+                continue  # 이미 '반납 지연'으로 들어간 건
             add("crit" if days < 0 else "warn", "대여", f"내 대여 반납 {'지연' if days < 0 else '예정'}: {r['품명']}",
-                f"반납 예정 {r['반납예정일']}", "rental")
+                f"반납 예정 {r['반납예정일']} · {r['대여번호']}", "rental", ("rental", r["대여번호"]))
     order = {"crit": 0, "warn": 1, "info": 2}
     return sorted(out, key=lambda x: order[x["심각도"]])
 

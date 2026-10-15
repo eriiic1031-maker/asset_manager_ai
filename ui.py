@@ -30,6 +30,8 @@ def inject_css():
         """
         <style>
         .block-container {padding-top: 4rem; padding-bottom: 2rem;}  /* 위쪽 상단 바(Share·⋮)에 첫 줄이 가리지 않게 */
+        .nav-section {font-size:12px;color:#64748b;font-weight:700;margin:14px 0 2px 4px;letter-spacing:.02em;}
+        section[data-testid='stSidebar'] [data-testid='stPageLink'] a {padding-top:2px;padding-bottom:2px;}
         .kpi-card {border:1px solid #e6e8eb;border-radius:16px;padding:16px 18px;background:#fff;box-shadow:0 2px 10px rgba(0,0,0,.04);min-height:115px;}
         .kpi-card.warn {border-color:#fcd34d;background:#fffbeb;}
         .kpi-card.crit {border-color:#fca5a5;background:#fef2f2;}
