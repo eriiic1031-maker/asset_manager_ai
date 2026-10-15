@@ -197,59 +197,278 @@ def rental_page(u: dict):
 # =========================================================
 # 🔧 점검 · 수리 · 보증
 # =========================================================
+MT_GUIDE = """
+**이렇게 운영합니다**
+
+1. **점검 계획 등록** — 소방설비·크레인·계측기처럼 정기적으로 점검·검사·검교정을 받아야 하는 자산에
+   '➕ 점검 계획 등록'으로 주기(예: 12개월)와 최근 점검일을 넣습니다. 다음 점검일이 자동으로 정해집니다.
+2. **지연·임박 확인** — 위 카드의 **[목록 보기]** 를 누르면 처리할 목록이 나옵니다. 사이드바 🔔 알림에도 뜹니다.
+3. **점검하고 완료 기록** — 점검을 마치면 그 줄의 **✅ 점검 완료** 를 눌러 점검일·결과·비용을 넣습니다.
+   다음 점검일이 주기만큼 자동으로 넘어가 목록에서 빠집니다. 여러 건을 같은 날 정상 완료했다면 체크 후 **일괄 완료**.
+   업체 일정 등으로 미뤄야 하면 **📅 일정 변경** (사유가 이력에 남습니다).
+4. **이상이 있으면 수리** — 결과가 '조치 필요·불합격'이면 자산이 **수리중**으로 바뀌어 '수리 중' 목록에 올라갑니다.
+   수리가 끝나면 **🔧 수리 완료** 를 눌러 비용을 기록하면 다시 사용중이 됩니다.
+5. **보증 관리** — 보증 만료가 다가오면 무상 수리를 받거나(**🔧 보증 수리**), 연장 보증을 샀다면 **🛡 보증 연장** 으로 만료일을 바꿉니다.
+
+누적 수리비가 장부가보다 크면 ♻️ 처분 검토 대상에 자동으로 올라갑니다.
+"""
+
+
+@st.dialog("✅ 점검 완료 기록", width="large")
+def dlg_plan_done(pno: str, u: dict):
+    p = d.lookup("maint_plans", pno)
+    a = d.get_asset(p["태그번호"]) if p else None
+    if not p or not a:
+        st.error("점검 계획을 찾을 수 없습니다.")
+        return
+    st.markdown(f"**{html.escape(p['점검명'])}** · {html.escape(a['품명'])} ({a['태그번호']}) · {a['현장']} · "
+                f"예정일 {ui.fmt_date(p['다음점검일'])} · {p['주기개월']}개월마다")
+    if not wf.manages(u, a["현장"]):
+        st.info(f"{a['현장']} 담당자가 기록합니다.")
+        return
+    vendors = [""] + ops.vendor_names()
+    c1, c2, c3 = st.columns(3)
+    when = c1.date_input("점검일", value=d.today(), key=f"pd-when-{pno}")
+    result = c2.selectbox("결과", ["정상", "조치 필요", "불합격"], key=f"pd-res-{pno}")
+    cost = c3.number_input("비용(원)", min_value=0, step=10000, key=f"pd-cost-{pno}")
+    content = st.text_input("내용", value=p["점검명"], key=f"pd-txt-{pno}")
+    vendor = st.selectbox("업체", vendors, index=vendors.index(p["담당업체"]) if p["담당업체"] in vendors else 0, key=f"pd-v-{pno}", format_func=lambda x: x or "(선택 안 함)")
+    repair = False
+    if result != "정상":
+        repair = st.checkbox("자산을 '수리중'으로 바꾸기 (수리가 끝나면 🔧 수리 완료로 되돌립니다)", value=True, key=f"pd-rep-{pno}")
+    st.caption(f"저장하면 다음 점검일이 {ui.fmt_date(d._shift_months_exact(when, int(p['주기개월'] or 12)))}(으)로 바뀝니다.")
+    if st.button("✅ 점검 완료 기록", type="primary", width="stretch", key=f"pd-go-{pno}"):
+        if ui.run_action(ops.complete_plan, pno, when, result, cost, content, vendor, auth.actor(u), repair,
+                         success=f"{a['품명']} {p['점검명']} 완료를 기록했습니다. 다음 점검일이 갱신되었습니다."):
+            st.rerun()
+
+
+@st.dialog("✅ 일괄 점검 완료", width="large")
+def dlg_plan_bulk(pnos: list[str], u: dict):
+    plans = [p for p in (d.lookup("maint_plans", n) for n in pnos) if p]
+    st.markdown(f"선택한 **{len(plans)}건**을 같은 날 **정상** 완료로 기록합니다. 비용·이상이 있는 건은 한 건씩 기록하세요.")
+    st.dataframe(pd.DataFrame(plans)[["계획번호", "점검명", "태그번호", "다음점검일", "담당업체"]], hide_index=True, width="stretch")
+    when = st.date_input("점검일", value=d.today(), key="pb-when")
+    if st.button(f"✅ {len(plans)}건 완료 기록", type="primary", width="stretch"):
+        n = ui.run_action(ops.complete_plans_bulk, [p["계획번호"] for p in plans], when, auth.actor(u))
+        if n:
+            for k in [k for k in st.session_state if str(k).startswith("mt-pick-")]:
+                del st.session_state[k]
+            ui.flash(f"{n}건 점검 완료를 기록했습니다.")
+            st.rerun()
+
+
+@st.dialog("📅 점검 일정 변경")
+def dlg_postpone(pno: str, u: dict):
+    p = d.lookup("maint_plans", pno)
+    if not p:
+        st.error("점검 계획을 찾을 수 없습니다.")
+        return
+    st.markdown(f"**{html.escape(p['점검명'])}** · {p['태그번호']} · 지금 예정일 {ui.fmt_date(p['다음점검일'])}")
+    new = st.date_input("새 점검일", value=d.today() + timedelta(days=14), key=f"pp-date-{pno}")
+    reason = st.text_input("사유 *", placeholder="예: 업체 일정, 장비 가동 중", key=f"pp-why-{pno}")
+    if st.button("일정 변경", type="primary", width="stretch", key=f"pp-go-{pno}"):
+        if ui.run_action(ops.postpone_plan, pno, new, reason, auth.actor(u), success="점검 일정을 바꿨습니다."):
+            st.rerun()
+
+
+@st.dialog("🔧 수리 기록", width="large")
+def dlg_repair(tag: str, u: dict, warranty: bool = False):
+    a = d.get_asset(tag)
+    if not a:
+        st.error("자산을 찾을 수 없습니다.")
+        return
+    st.markdown(f"**{html.escape(a['품명'])}** ({tag}) · {a['현장']} · 지금 상태 {ui.badge(a['상태'])}"
+                + (f" · 보증 만료 {ui.fmt_date(a['보증만료일'])}" if a["보증만료일"] else ""), unsafe_allow_html=True)
+    vendors = [""] + ops.vendor_names()
+    c1, c2 = st.columns(2)
+    when = c1.date_input("수리일", value=d.today(), key=f"rp-when-{tag}")
+    vendor = c2.selectbox("수리 업체", vendors, key=f"rp-v-{tag}", format_func=lambda x: x or "(선택 안 함)")
+    content = st.text_input("수리 내용 *", placeholder="예: 유압 실린더 교체", key=f"rp-txt-{tag}")
+    c1, c2 = st.columns(2)
+    warranty = c1.checkbox("보증(무상) 수리", value=warranty, key=f"rp-w-{tag}")
+    cost = c2.number_input("비용(원)", min_value=0, step=10000, key=f"rp-cost-{tag}", disabled=warranty)
+    status = st.radio("수리 상태", ["수리 완료 (사용중으로 복귀)", "수리 진행 중 (수리중으로 표시)"],
+                      index=0 if a["상태"] == "수리중" else 1, horizontal=True, key=f"rp-st-{tag}")
+    if st.button("🔧 수리 기록", type="primary", width="stretch", key=f"rp-go-{tag}"):
+        if ui.run_action(ops.record_repair, tag, when, content, vendor, cost, status.startswith("수리 완료"), auth.actor(u), warranty,
+                         success="수리 기록을 남겼습니다."):
+            st.rerun()
+
+
+@st.dialog("🛡 보증 연장")
+def dlg_warranty(tag: str, u: dict):
+    a = d.get_asset(tag)
+    if not a:
+        st.error("자산을 찾을 수 없습니다.")
+        return
+    st.markdown(f"**{html.escape(a['품명'])}** ({tag}) · 지금 보증 만료 {ui.fmt_date(a['보증만료일'])}")
+    base = a["보증만료일"] or d.today()
+    new = st.date_input("새 보증 만료일", value=d._shift_months_exact(base, 12), key=f"wr-date-{tag}")
+    note = st.text_input("메모", placeholder="예: 연장 보증 1년 구매, 계약번호", key=f"wr-note-{tag}")
+    if st.button("🛡 연장", type="primary", width="stretch", key=f"wr-go-{tag}"):
+        if ui.run_action(ops.extend_warranty, tag, new, note, auth.actor(u), success="보증 만료일을 바꿨습니다."):
+            st.rerun()
+
+
+@st.dialog("➕ 점검 계획 등록", width="large")
+def dlg_new_plan(u: dict):
+    scope = _scope(u)
+    q = st.text_input("자산 찾기 (태그번호·품명·규격)", key="np-q", placeholder="예: 지게차, MCH-2023").strip().lower()
+    pool = [a for a in d.active_assets() if (not scope or a["현장"] == scope)
+            and (not q or q in a["태그번호"].lower() or q in a["품명"].lower() or q in a["규격"].lower())]
+    if not q:
+        pool = [a for a in pool if a["계정과목"] in ("기계장치", "공기구비품", "차량운반구")]
+    pool = pool[:200]
+    if not pool:
+        st.info("찾는 자산이 없습니다.")
+        return
+    tag = st.selectbox("자산", [a["태그번호"] for a in pool], key="np-tag",
+                       format_func=lambda t: next(f"{t} · {a['품명']} · {a['현장']}" for a in pool if a["태그번호"] == t))
+    c1, c2 = st.columns(2)
+    name = c1.text_input("점검명 *", placeholder="예: 지게차 안전검사", key="np-name")
+    kind = c2.selectbox("구분", ["정기점검", "법정검사", "검교정"], key="np-kind")
+    c1, c2, c3 = st.columns(3)
+    months = c1.number_input("주기(개월)", min_value=1, max_value=120, value=12, key="np-m")
+    last = c2.date_input("최근 점검일", value=d.today(), key="np-last")
+    vendor = c3.selectbox("담당 업체", [""] + ops.vendor_names(), key="np-v", format_func=lambda x: x or "(선택 안 함)")
+    st.caption(f"다음 점검일: {ui.fmt_date(d._shift_months_exact(last, int(months)))}")
+    if st.button("계획 등록", type="primary", width="stretch", key="np-go"):
+        if ui.run_action(ops.save_plan, {"태그번호": tag, "점검명": name, "구분": kind, "주기개월": months,
+                                         "최근점검일": last, "담당업체": vendor}, auth.actor(u), success="점검 계획을 등록했습니다."):
+            st.rerun()
+
+
+def _row_buttons(btns: list[tuple], key: str):
+    for i, (col, (label, fn, primary)) in enumerate(zip(st.columns(len(btns)), btns)):
+        if col.button(label, key=f"{key}-{i}", width="stretch", type="primary" if primary else "secondary"):
+            fn()
+
+
+def _search(rows: list[dict], key: str, fields=("태그번호", "품명", "현장")) -> list[dict]:
+    q = st.text_input("검색", key=key, placeholder="태그번호·품명·현장·점검명", label_visibility="collapsed").strip().lower()
+    return [r for r in rows if not q or any(q in str(r.get(f, "")).lower() for f in fields)]
+
+
+def _plan_list(rows: list[dict], u: dict, key: str):
+    rows = _search(rows, f"{key}-q", ("태그번호", "품명", "현장", "점검명", "담당업체"))
+    if not rows:
+        st.success("처리할 점검이 없습니다.")
+        return
+    mine = [p for p in rows if wf.manages(u, p["현장"])]
+    picked = [p["계획번호"] for p in mine if st.session_state.get(f"mt-pick-{p['계획번호']}")]
+    c1, c2 = st.columns([3, 1.4])
+    c1.caption(f"{len(rows)}건 · 줄마다 버튼으로 처리하거나, 왼쪽을 체크해 같은 날 정상 완료한 건을 한 번에 기록합니다.")
+    if c2.button(f"✅ 선택 {len(picked)}건 일괄 완료", disabled=not picked, width="stretch", key=f"{key}-bulk"):
+        dlg_plan_bulk(picked, u)
+    for p in ui.paginate(rows, key, 20):
+        can = wf.manages(u, p["현장"])
+        with st.container(border=True):
+            c0, c1, c2 = st.columns([0.3, 3.2, 2.6], vertical_alignment="center")
+            if can:
+                c0.checkbox("선택", key=f"mt-pick-{p['계획번호']}", label_visibility="collapsed")
+            late = p["남은 일수"] < 0
+            c1.markdown(f"{'🔴' if late else '🟡'} **{html.escape(p['품명'])} · {html.escape(p['점검명'])}** "
+                        f"<span class='badge {'rejected' if late else 'pending'}'>{'지연 ' + str(-p['남은 일수']) + '일' if late else str(p['남은 일수']) + '일 남음'}</span>"
+                        f"<br><span class='small-muted'>{p['태그번호']} · {p['현장']} · {p['구분']} · 예정일 {ui.fmt_date(p['다음점검일'])} · "
+                        f"{p['주기개월']}개월마다 · {html.escape(p['담당업체'] or '업체 미지정')}</span>", unsafe_allow_html=True)
+            with c2:
+                if can:
+                    _row_buttons([("✅ 점검 완료", lambda p=p: dlg_plan_done(p["계획번호"], u), True),
+                                  ("📅 일정 변경", lambda p=p: dlg_postpone(p["계획번호"], u), False),
+                                  ("🔍 자산", lambda p=p: wf.asset_dialog(p["태그번호"], u), False)], f"{key}-{p['계획번호']}")
+                else:
+                    st.caption(f"{p['현장']} 담당자 처리")
+
+
 def maint_page(u: dict):
     st.title("🔧 정기 점검 · 수리 · 보증")
-    st.caption("소방설비·크레인·계측기 같은 법정검사·검교정·정기점검 일정과 수리 이력·비용을 관리합니다. "
-               "점검 계획은 자산 상세의 '🔧 점검·수리' 탭에서 추가하고, 완료를 기록하면 다음 점검일이 자동으로 정해집니다.")
     scope = _scope(u)
-    days = st.slider("며칠 안에 오는 일정까지 볼까요?", 7, 180, d.setting_num("알림 기준일", 30), key="mt-days")
+    days = d.setting_num("알림 기준일", 30)
     due = ops.plans_due(days, scope)
+    late = [p for p in due if p["상태"] == "지연"]
+    soon = [p for p in due if p["상태"] == "임박"]
     warr = ops.warranty_expiring(days, scope)
+    fixing = ops.repairing_assets(scope)
     logs = [r for r in d.load("maint_logs") if not scope or (d.get_asset(r["태그번호"]) or {}).get("현장") == scope]
     year_cost = sum(r["비용"] or 0 for r in logs if r["일자"] and r["일자"].year == d.today().year)
-    k = st.columns(4)
-    with k[0]: ui.kpi("점검 지연", sum(1 for p in due if p["상태"] == "지연"), "예정일이 지난 점검", "crit" if any(p["상태"] == "지연" for p in due) else "", "건")
-    with k[1]: ui.kpi("점검 임박", sum(1 for p in due if p["상태"] == "임박"), f"{days}일 안", "warn" if due else "", "건")
-    with k[2]: ui.kpi("보증 만료 임박", len(warr), f"{days}일 안", "warn" if warr else "", "개")
-    with k[3]: ui.kpi(f"{d.today().year}년 점검·수리비", ui.short_won(year_cost), ui.won(year_cost), unit="원")
 
-    tabs = st.tabs(["📅 점검 일정", "🛡 보증 만료", "🧾 점검·수리 기록", "💸 수리비 많은 자산"])
-    with tabs[0]:
-        if not due:
-            st.success(f"{days}일 안에 예정된 점검이 없습니다.")
-        else:
-            df = pd.DataFrame(due)[["계획번호", "상태", "남은 일수", "다음점검일", "구분", "점검명", "태그번호", "품명", "현장", "담당업체", "주기개월"]]
-            ev = st.dataframe(df, hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row", key="mt-due")
-            sel = [df.iloc[i] for i in ev.selection.rows if i < len(df)]
-            if sel:
-                p = sel[0]
-                a = d.get_asset(p["태그번호"])
-                if a and wf.manages(u, a["현장"]):
-                    with st.form("mt-done"):
-                        st.markdown(f"**{p['점검명']}** 완료 기록 · {p['품명']} ({p['태그번호']})")
-                        c1, c2, c3 = st.columns(3)
-                        when = c1.date_input("점검일", value=d.today())
-                        result = c2.selectbox("결과", ["정상", "조치 필요", "불합격"])
-                        cost = c3.number_input("비용(원)", min_value=0, step=10000)
-                        content = st.text_input("내용", value=p["점검명"])
-                        vendor = st.selectbox("업체", [""] + ops.vendor_names(), index=([""] + ops.vendor_names()).index(p["담당업체"]) if p["담당업체"] in ops.vendor_names() else 0)
-                        if st.form_submit_button("✅ 점검 완료 기록", type="primary"):
-                            if ui.run_action(d.add_maint_log, {"태그번호": p["태그번호"], "일자": when, "구분": p["구분"], "내용": content,
-                                                               "업체": vendor, "비용": cost, "결과": result, "계획번호": p["계획번호"]},
-                                             auth.actor(u), success="점검 완료를 기록했습니다. 다음 점검일이 갱신되었습니다."):
-                                st.rerun()
-                elif a:
-                    st.caption(f"{a['현장']} 담당자가 기록합니다.")
-            else:
-                st.caption("행을 고르면 점검 완료를 기록할 수 있습니다.")
-    with tabs[1]:
-        if not warr:
+    g1, g2 = st.columns([5, 1.4])
+    with g1.expander("📖 사용 방법 — 점검 계획 → 점검 완료 기록 → 이상 시 수리 → 보증 관리", expanded=not st.session_state.get("mt-view")):
+        st.markdown(MT_GUIDE)
+    if u.get("역할") in (ADMIN,) + SITE_ROLES and g2.button("➕ 점검 계획 등록", type="primary", width="stretch"):
+        dlg_new_plan(u)
+
+    views = {"late": "🔴 점검 지연", "soon": "🟡 점검 임박", "fix": "🔧 수리 중", "warr": "🛡 보증 만료 임박",
+             "plans": "🗓 점검 계획 전체", "logs": "🧾 점검·수리 기록", "top": "💸 수리비 많은 자산"}
+    cards = [("late", "점검 지연", len(late), "예정일이 지난 점검", "crit" if late else "", "건"),
+             ("soon", "점검 임박", len(soon), f"{days}일 안 예정", "warn" if soon else "", "건"),
+             ("fix", "수리 중", len(fixing), "수리 완료 기록 대기", "warn" if fixing else "", "개"),
+             ("warr", "보증 만료 임박", len(warr), f"{days}일 안", "warn" if warr else "", "개")]
+    cols = st.columns(5)
+    for col, (v, title, n, cap, tone, unit) in zip(cols, cards):
+        with col:
+            ui.kpi(title, n, cap, tone, unit)
+            if st.button("목록 보기 ›", key=f"mt-card-{v}", width="stretch", type="primary" if st.session_state.get("mt-view") == v else "secondary"):
+                st.session_state["mt-view"] = v
+                st.rerun()
+    with cols[4]:
+        ui.kpi(f"{d.today().year}년 점검·수리비", ui.short_won(year_cost), ui.won(year_cost), unit="원")
+        if st.button("기록 보기 ›", key="mt-card-logs", width="stretch"):
+            st.session_state["mt-view"] = "logs"
+            st.rerun()
+
+    if st.session_state.get("mt-view") not in views:
+        st.session_state["mt-view"] = "late" if late else "soon" if soon else "plans"
+    view = st.segmented_control("보기", list(views), format_func=views.get, key="mt-view", label_visibility="collapsed") or "late"
+
+    if view == "late":
+        _plan_list(late, u, "mt-late")
+    elif view == "soon":
+        _plan_list(soon, u, "mt-soon")
+    elif view == "fix":
+        rows = _search(fixing, "mt-fix-q")
+        if not rows:
+            st.success("수리 중인 자산이 없습니다.")
+        for a in ui.paginate(rows, "mt-fix", 20):
+            last = next((r for r in sorted(ops.logs_for(a["태그번호"]), key=lambda r: r["일자"] or d.today(), reverse=True)), None)
+            with st.container(border=True):
+                c1, c2 = st.columns([3.5, 2.6], vertical_alignment="center")
+                c1.markdown(f"🔧 **{html.escape(a['품명'])}** · {a['태그번호']} · {a['현장']}"
+                            + (f"<br><span class='small-muted'>최근: {ui.fmt_date(last['일자'])} {html.escape(last['구분'])} · {html.escape(last['내용'])}</span>" if last else ""),
+                            unsafe_allow_html=True)
+                with c2:
+                    if wf.manages(u, a["현장"]):
+                        _row_buttons([("🔧 수리 완료", lambda a=a: dlg_repair(a["태그번호"], u), True),
+                                      ("🔍 자산", lambda a=a: wf.asset_dialog(a["태그번호"], u), False)], f"mt-fix-{a['태그번호']}")
+    elif view == "warr":
+        rows = _search(warr, "mt-warr-q")
+        if not rows:
             st.success(f"{days}일 안에 보증이 끝나는 자산이 없습니다.")
-        else:
-            df = ui.asset_frame(warr, extra=["보증만료일"])
-            st.dataframe(df, hide_index=True, width="stretch", column_config=ui.ASSET_COLUMN_CONFIG)
-            st.caption("보증이 끝나기 전에 점검을 받거나 무상 수리를 신청하세요. 연장 보증을 사면 자산 정보의 보증 만료일을 고치세요.")
-    with tabs[2]:
+        for a in ui.paginate(rows, "mt-warr", 20):
+            left = (a["보증만료일"] - d.today()).days
+            with st.container(border=True):
+                c1, c2 = st.columns([3.2, 2.9], vertical_alignment="center")
+                c1.markdown(f"🛡 **{html.escape(a['품명'])}** · {a['태그번호']} · {a['현장']}"
+                            f"<br><span class='small-muted'>보증 만료 {ui.fmt_date(a['보증만료일'])} ({left}일 남음) · "
+                            f"{html.escape(a.get('공급업체') or a.get('구매처') or '')}</span>", unsafe_allow_html=True)
+                with c2:
+                    if wf.manages(u, a["현장"]):
+                        _row_buttons([("🔧 보증 수리", lambda a=a: dlg_repair(a["태그번호"], u, True), True),
+                                      ("🛡 보증 연장", lambda a=a: dlg_warranty(a["태그번호"], u), False),
+                                      ("🔍 자산", lambda a=a: wf.asset_dialog(a["태그번호"], u), False)], f"mt-warr-{a['태그번호']}")
+        st.caption("보증이 끝나기 전에 점검을 받아 무상 수리를 신청하세요. 연장 보증을 샀다면 '보증 연장'으로 만료일을 바꿉니다.")
+    elif view == "plans":
+        plans = []
+        for p in d.load("maint_plans"):
+            a = d.get_asset(p["태그번호"])
+            if p["활성"] == "Y" and a and d.is_active(a) and (not scope or a["현장"] == scope):
+                plans.append({**p, "품명": a["품명"], "현장": a["현장"],
+                              "남은 일수": (p["다음점검일"] - d.today()).days if p["다음점검일"] else 0})
+        plans.sort(key=lambda p: p["다음점검일"] or d.today())
+        st.caption(f"등록된 점검 계획 {len(plans):,}건 (보유 자산 기준). 새 자산은 오른쪽 위 '➕ 점검 계획 등록'으로 추가합니다.")
+        _plan_list(plans, u, "mt-all")
+    elif view == "logs":
         c1, c2 = st.columns([1, 2])
         kind = c1.selectbox("구분", ["전체"] + ops.MAINT_KINDS, key="mt-log-kind")
         q = c2.text_input("검색", key="mt-log-q", placeholder="태그번호·내용·업체").strip().lower()
@@ -265,7 +484,7 @@ def maint_page(u: dict):
             st.dataframe(df, hide_index=True, width="stretch", column_config=ui.money_config("비용"))
             st.caption(f"{len(rows):,}건 · 비용 합계 {ui.won(sum(r['비용'] or 0 for r in rows))}")
             st.download_button("📥 기록 엑셀", d.rows_to_xlsx({"점검수리기록": (cols, rows)}), file_name=f"점검수리기록_{d.today():%Y%m%d}.xlsx")
-    with tabs[3]:
+    else:
         top = [r for r in ops.top_repairs(50) if not scope or r["현장"] == scope][:20]
         if not top:
             st.info("수리 기록이 없습니다.")
@@ -639,33 +858,6 @@ def budget_page(u: dict):
 def all_alerts(u: dict) -> list[dict]:
     """지금 사용자의 알림 전체 (결재·대여 대기는 한 건씩)."""
     return ops.alerts_for(u, wf.pending_for(u), rentals=wf.pending_rentals(u))
-
-
-@st.dialog("✅ 점검 완료 기록", width="large")
-def dlg_plan_done(pno: str, u: dict):
-    p = d.lookup("maint_plans", pno)
-    a = d.get_asset(p["태그번호"]) if p else None
-    if not p or not a:
-        st.error("점검 계획을 찾을 수 없습니다.")
-        return
-    st.markdown(f"**{html.escape(p['점검명'])}** · {html.escape(a['품명'])} ({a['태그번호']}) · {a['현장']} · "
-                f"예정일 {ui.fmt_date(p['다음점검일'])}")
-    if not wf.manages(u, a["현장"]):
-        st.info(f"{a['현장']} 담당자가 기록합니다.")
-        return
-    vendors = [""] + ops.vendor_names()
-    with st.form(f"dlg-mt-{pno}"):
-        c1, c2, c3 = st.columns(3)
-        when = c1.date_input("점검일", value=d.today())
-        result = c2.selectbox("결과", ["정상", "조치 필요", "불합격"])
-        cost = c3.number_input("비용(원)", min_value=0, step=10000)
-        content = st.text_input("내용", value=p["점검명"])
-        vendor = st.selectbox("업체", vendors, index=vendors.index(p["담당업체"]) if p["담당업체"] in vendors else 0)
-        if st.form_submit_button("✅ 점검 완료 기록", type="primary", width="stretch"):
-            if ui.run_action(d.add_maint_log, {"태그번호": p["태그번호"], "일자": when, "구분": p["구분"], "내용": content,
-                                               "업체": vendor, "비용": cost, "결과": result, "계획번호": pno},
-                             auth.actor(u), success="점검 완료를 기록했습니다. 다음 점검일이 갱신되었습니다."):
-                st.rerun()
 
 
 @st.dialog("👥 퇴사 자산 회수", width="large")

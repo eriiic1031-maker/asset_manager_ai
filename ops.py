@@ -348,6 +348,73 @@ def logs_for(tag: str) -> list[dict]:
     return sorted([r for r in d.load("maint_logs") if r["태그번호"] == tag], key=lambda r: r["일자"] or date.min, reverse=True)
 
 
+def postpone_plan(pno: str, new_date, reason: str, actor: str):
+    """점검 일정을 바꿉니다(업체 일정·장비 가동 등). 사유는 자산 이력에 남습니다."""
+    p = d.lookup("maint_plans", pno)
+    if not p:
+        raise DataError("점검 계획을 찾을 수 없습니다.")
+    new_date = to_date(new_date)
+    if not new_date:
+        raise DataError("새 점검일을 고르세요.")
+    if not clean_str(reason):
+        raise DataError("일정을 바꾸는 사유를 입력하세요.")
+    d.upsert("maint_plans", [dict(p, 다음점검일=new_date)])
+    d.add_history(p["태그번호"], "점검 일정 변경", f"{p['점검명']}: {p['다음점검일']} → {new_date} ({reason})", actor)
+
+
+def complete_plan(pno: str, when, result: str, cost: float, content: str, vendor: str, actor: str,
+                  start_repair: bool = False) -> str:
+    """점검 완료 기록 → 다음 점검일 자동 갱신. 결과가 이상하면 자산을 '수리중'으로 돌릴 수 있습니다."""
+    p = d.lookup("maint_plans", pno)
+    if not p:
+        raise DataError("점검 계획을 찾을 수 없습니다.")
+    no = d.add_maint_log({"태그번호": p["태그번호"], "일자": when, "구분": p["구분"], "내용": content or p["점검명"],
+                          "업체": vendor, "비용": cost, "결과": result, "계획번호": pno}, actor)
+    a = d.get_asset(p["태그번호"])
+    if start_repair and result != "정상" and a and a["상태"] != "수리중":
+        d.update_asset(a["태그번호"], {"상태": "수리중", "이전상태": a["상태"]}, actor, "수리 시작", f"{p['점검명']} 결과 {result}")
+    return no
+
+
+def complete_plans_bulk(pnos: list[str], when, actor: str) -> int:
+    """여러 점검을 같은 날 '정상'으로 한 번에 완료 처리합니다."""
+    for pno in pnos:
+        complete_plan(pno, when, "정상", 0, "", (d.lookup("maint_plans", pno) or {}).get("담당업체", ""), actor)
+    return len(pnos)
+
+
+def record_repair(tag: str, when, content: str, vendor: str, cost: float, finished: bool, actor: str,
+                  warranty: bool = False) -> str:
+    """수리 기록. finished=True면 '수리중' 자산을 원래 상태(없으면 사용중)로 돌리고, False면 '수리중'으로 둡니다."""
+    a = d.get_asset(tag)
+    if not a:
+        raise DataError("자산을 찾을 수 없습니다.")
+    if not clean_str(content):
+        raise DataError("수리 내용을 입력하세요.")
+    no = d.add_maint_log({"태그번호": tag, "일자": when, "구분": "수리", "내용": content + (" (보증 수리)" if warranty else ""),
+                          "업체": vendor, "비용": 0 if warranty else cost, "결과": "완료" if finished else "진행중"}, actor)
+    if finished and a["상태"] == "수리중":
+        back = a.get("이전상태") if a.get("이전상태") in ("사용중", "유휴") else "사용중"
+        d.update_asset(tag, {"상태": back, "이전상태": ""}, actor, "수리 완료", content)
+    elif not finished and a["상태"] != "수리중":
+        d.update_asset(tag, {"상태": "수리중", "이전상태": a["상태"]}, actor, "수리 시작", content)
+    return no
+
+
+def extend_warranty(tag: str, new_date, note: str, actor: str):
+    a = d.get_asset(tag)
+    if not a:
+        raise DataError("자산을 찾을 수 없습니다.")
+    new_date = to_date(new_date)
+    if not new_date or (a["보증만료일"] and new_date <= a["보증만료일"]):
+        raise DataError("지금 만료일보다 뒤 날짜를 고르세요.")
+    d.update_asset(tag, {"보증만료일": new_date}, actor, "보증 연장", f"{a['보증만료일'] or '-'} → {new_date}" + (f" · {note}" if note else ""))
+
+
+def repairing_assets(site: str | None = None) -> list[dict]:
+    return [a for a in d.active_assets() if a["상태"] == "수리중" and (not site or a["현장"] == site)]
+
+
 def plans_due(days: int | None = None, site: str | None = None) -> list[dict]:
     """다음 점검일이 지났거나 days일 안에 오는 계획(보유 자산만)."""
     days = d.setting_num("알림 기준일", 30) if days is None else days
