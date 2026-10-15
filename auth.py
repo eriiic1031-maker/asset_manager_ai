@@ -6,7 +6,7 @@
 사이드바에서 언제든 다른 사람으로 바꿀 수 있습니다. 고른 사람의 역할에 따라 메뉴와 권한이 달라집니다.
 
 역할 6가지
-- 관리자     : 자산 등록·결재·설정 등 모든 기능 (자산관리팀)
+- 관리자     : 자산 등록·결재·설정 등 모든 기능 (총무)
 - 임원       : 고액 구매 최종 승인, 현황·분석 열람
 - 재무       : 감가상각·결산·분개·예산·렌탈리스 관리, 현황 열람
 - 현장책임자 : 자기 현장의 1차 결재(구매), 현장 담당 업무
@@ -89,20 +89,21 @@ def save_user(fields: dict, actor: str, uid: str | None = None) -> str:
     return rec["아이디"]
 
 
-ADMIN_ID, ADMIN_NAME = "admin", "김재열"
+ADMIN_ID, ADMIN_NAME, ADMIN_DEPT = "admin", "김재열", "총무"
 
 
 def ensure_default_admin() -> None:
     """관리자(김재열)가 없으면 만듭니다. 예시 데이터를 지워도 남는 실제 관리자입니다."""
     cur = get_user(ADMIN_ID)
     if cur:
-        if cur["이름"] == "김자산" or cur["비고"] == d.SAMPLE_MARK:  # 이전 버전의 체험용 관리자 → 김재열로 바꿈
-            d.upsert("users", [dict(cur, 이름=ADMIN_NAME, 비고="")])
+        # 이전 버전의 기본 관리자(김자산 · 자산관리팀) → 총무 김재열로 바꿈
+        if cur["이름"] == "김자산" or cur["비고"] == d.SAMPLE_MARK or cur["부서"] == "자산관리팀":
+            d.upsert("users", [dict(cur, 이름=ADMIN_NAME, 부서=ADMIN_DEPT, 비고="")])
         return
     if any(u["역할"] == ADMIN for u in get_users(True)):
         return
     rec = {c: "" for c in d.TABLES["users"]["cols"]}
-    rec.update({"아이디": ADMIN_ID, "이름": ADMIN_NAME, "역할": ADMIN, "부서": "자산관리팀", "위원": "Y", "활성": "Y",
+    rec.update({"아이디": ADMIN_ID, "이름": ADMIN_NAME, "역할": ADMIN, "부서": ADMIN_DEPT, "위원": "Y", "활성": "Y",
                 "생성일시": d.now_text()})
     d.upsert("users", [rec])
 
