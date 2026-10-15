@@ -15,11 +15,12 @@ from __future__ import annotations
 
 import csv
 import io
+import os
 import random
 import re
 import sqlite3
 import threading
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
@@ -31,8 +32,16 @@ from openpyxl.utils import get_column_letter
 # 경로 / 기준 정보
 # =========================================================
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
+# ASSET_DATA_DIR 환경변수로 저장 위치를 바꿀 수 있습니다(테스트용).
+DATA_DIR = Path(os.environ.get("ASSET_DATA_DIR") or BASE_DIR / "data")
 DB_FILE = DATA_DIR / "자산관리.db"
+
+# 한국 시간(서머타임 없음). 인터넷 서버(Streamlit Cloud)는 UTC로 돌아가서 날짜가 하루 어긋나므로 고정합니다.
+KST = timezone(timedelta(hours=9), "KST")
+# Streamlit Community Cloud에서는 앱이 /mount/src 아래에서 실행됩니다(공개 데모, 메모리 작음).
+ON_CLOUD = str(BASE_DIR).startswith("/mount/src") or os.environ.get("ASSET_DEMO") == "1"
+DEMO_SAMPLE = (2000, 10000)      # 공개 데모: 보유 2천 · 처분 1만
+FULL_SAMPLE = (20500, 180000)    # 대량 확인용: 보유 2만 500 · 처분 18만
 
 # 법인차량 관리 프로그램과 같은 현장 구성으로 시작합니다.
 DEFAULT_SITES = [
@@ -61,7 +70,7 @@ DISPOSAL_METHODS = ["폐기", "매각", "기증", "사내 경매", "망실"]
 FLOWS = {
     "pr": ["요청", "승인", "발주", "검수완료", "등록완료"],
     "move": ["요청", "승인", "완료"],
-    "inc": ["접수", "조사완료", "종결"],
+    "inc": ["경위요청", "접수", "조사완료", "종결"],
     "dsp": ["신청", "승인", "집행완료", "제적완료"],
 }
 KIND_NAMES = {"pr": "구매요청", "move": "이동신청", "inc": "분실·파손", "dsp": "처분"}
@@ -71,11 +80,20 @@ REJECTED = "반려"
 STORAGE_DEVICE_PATTERN = re.compile(r"노트북|PC|데스크탑|컴퓨터|워크스테이션|서버|태블릿|NAS|SSD|HDD|저장", re.I)
 
 DEFAULT_SETTINGS = {
-    "회사명": ("", "QR 라벨 상단에 표시할 회사 이름"),
-    "관리자명": ("자산관리자", "관리자 화면에서 처리자로 기록되는 이름"),
-    "관리자 PIN": ("", "비워 두면 관리자 페이지에 PIN 없이 들어갑니다"),
+    "회사명": ("", "QR 라벨·문서 상단에 표시할 회사 이름"),
     "자본화 기준금액": ("1000000", "단가가 이 금액 미만이면 소모품(비용)으로 분류를 제안합니다"),
-    "QR 기본주소": ("", "예: http://192.168.0.10:8502  비우면 QR에 태그번호만 담깁니다"),
+    "결재 기준1": ("1000000", "구매 총액이 이 금액 미만이면 현장책임자 전결"),
+    "결재 기준2": ("10000000", "이 금액 미만이면 현장책임자 → 자산관리자, 이상이면 → 임원까지"),
+    "위원회 정족수": ("2", "불용품 판정 위원회에서 승인(또는 반려)에 필요한 찬성(반대) 수"),
+    "알림 기준일": ("30", "보증·점검·계약 만료 며칠 전부터 알릴지"),
+    "운행일지 경로": ("", "법인차량 프로그램의 운행일지.xlsx 전체 경로 (월별 KM 연동)"),
+    "메일 서버": ("", "예: smtp.gmail.com (비우면 메일 알림을 보내지 않습니다)"),
+    "메일 포트": ("587", "보통 587(STARTTLS)"),
+    "메일 계정": ("", "보내는 메일 계정"),
+    "메일 비밀번호": ("", "앱 비밀번호 권장"),
+    "알림 받는 메일": ("", "쉼표로 여러 명"),
+    "웹훅 주소": ("", "Slack·Teams·Discord 수신 웹훅 URL (비우면 보내지 않음)"),
+    "QR 기본주소": ("", "예: http://192.168.0.10:8501  비우면 QR에 태그번호만 담깁니다"),
     "차량목록 경로": ("", "법인차량 관리 프로그램의 차량목록.xlsx 전체 경로"),
     "Ollama 주소": ("http://127.0.0.1:11434", "AI 요청 분석에 쓰는 Ollama 서버"),
     "Ollama 모델": ("qwen2.5vl:3b", "AI 요청 분석 모델"),
@@ -92,9 +110,10 @@ TABLES = {
         "cols": ["태그번호", "품명", "규격", "시리얼번호", "계정과목", "자산구분", "현장", "관리부서", "사용자",
                  "설치위치", "취득일자", "취득가액", "내용연수", "상각방법", "잔존가액", "공급업체", "상태",
                  "이전상태", "수리견적", "처분일자", "처분방법", "처분처", "처분금액", "처분손익", "처분요청번호",
-                 "연결차량번호", "구매요청번호", "등록일시", "비고"],
-        "dates": ["취득일자", "처분일자"],
-        "nums": ["취득가액", "내용연수", "잔존가액", "수리견적", "처분금액", "처분손익"],
+                 "연결차량번호", "구매요청번호", "등록일시", "비고",
+                 "공용", "보증만료일", "사용자사번", "세무 내용연수", "세무 상각방법"],
+        "dates": ["취득일자", "처분일자", "보증만료일"],
+        "nums": ["취득가액", "내용연수", "잔존가액", "수리견적", "처분금액", "처분손익", "세무 내용연수"],
     },
     "sites": {
         "label": "현장목록", "key": ["현장명"], "cache": True, "legacy": ("현장목록.xlsx", "현장목록"),
@@ -112,9 +131,9 @@ TABLES = {
                  "견적1 업체", "견적1 단가", "견적1 조건", "견적2 업체", "견적2 단가", "견적2 조건",
                  "견적3 업체", "견적3 단가", "견적3 조건", "선정업체", "선정단가", "선정사유",
                  "검수 규격", "검수 입고수량", "검수 파손", "검수 시리얼", "검수 메모", "검수자", "검수일시",
-                 "등록 태그번호", "처리이력"],
+                 "등록 태그번호", "처리이력", "결재선", "결재단계", "발주일시", "입고누계"],
         "dates": ["필요일"],
-        "nums": ["수량", "예상단가", "견적1 단가", "견적2 단가", "견적3 단가", "선정단가", "검수 입고수량"],
+        "nums": ["수량", "예상단가", "견적1 단가", "견적2 단가", "견적3 단가", "선정단가", "검수 입고수량", "결재단계", "입고누계"],
     },
     "move": {
         "label": "이동신청", "key": ["요청번호"], "cache": True, "legacy": ("자산요청.xlsx", "이동신청"),
@@ -133,8 +152,10 @@ TABLES = {
         "label": "처분", "key": ["요청번호"], "cache": True, "legacy": ("자산요청.xlsx", "처분"),
         "cols": ["요청번호", "상태", "요청일시", "신청자", "현장", "태그번호", "품명", "불용사유", "희망 처분방법",
                  "상세사유", "위원회 의견", "승인일시", "처분방법", "집행일", "처분처", "처분금액", "보안파기 확인",
-                 "파기증명번호", "장부가 합계", "처분손익", "제적일시", "처리이력"],
-        "dates": ["집행일"], "nums": ["처분금액", "장부가 합계", "처분손익"],
+                 "파기증명번호", "장부가 합계", "처분손익", "제적일시", "처리이력",
+                 "입찰1 매수자", "입찰1 금액", "입찰1 조건", "입찰2 매수자", "입찰2 금액", "입찰2 조건",
+                 "입찰3 매수자", "입찰3 금액", "입찰3 조건", "낙찰자", "낙찰금액"],
+        "dates": ["집행일"], "nums": ["처분금액", "장부가 합계", "처분손익", "입찰1 금액", "입찰2 금액", "입찰3 금액", "낙찰금액"],
     },
     "history": {
         "label": "자산이력", "key": None, "cache": False, "legacy": ("자산이력.xlsx", "자산이력"),
@@ -163,6 +184,91 @@ TABLES = {
                  "기초 장부가", "당기 취득", "당기 상각비", "월 상각비", "상각누계액", "기말 장부가", "경과월", "비고"],
         "dates": ["취득일자"],
         "nums": ["취득가액", "내용연수", "기초 장부가", "당기 취득", "당기 상각비", "월 상각비", "상각누계액", "기말 장부가", "경과월"],
+    },
+    "users": {
+        "label": "사용자", "key": ["아이디"], "cache": True, "legacy": None,
+        "cols": ["아이디", "이름", "역할", "현장", "부서", "이메일", "연락처", "위원", "활성", "생성일시", "비고"],
+        "dates": [], "nums": [],
+    },
+    "employees": {
+        "label": "직원", "key": ["사번"], "cache": True, "legacy": None,
+        "cols": ["사번", "이름", "현장", "부서", "직급", "이메일", "연락처", "상태", "입사일", "퇴사일", "비고"],
+        "dates": ["입사일", "퇴사일"], "nums": [],
+    },
+    "returns": {
+        "label": "퇴사회수", "key": ["회수번호"], "cache": True, "legacy": None,
+        "cols": ["회수번호", "사번", "이름", "현장", "부서", "퇴사일", "상태", "생성자", "생성일시", "완료일시"],
+        "dates": ["퇴사일"], "nums": [],
+    },
+    "return_items": {
+        "label": "회수항목", "key": ["회수번호", "태그번호"], "cache": False, "legacy": None,
+        "cols": ["회수번호", "태그번호", "품명", "결과", "인계자", "메모", "처리자", "처리일시"],
+        "dates": [], "nums": [], "index": [["회수번호"]],
+    },
+    "vendors": {
+        "label": "공급업체", "key": ["업체명"], "cache": True, "legacy": None,
+        "cols": ["업체명", "사업자번호", "담당자", "연락처", "이메일", "주소", "취급품목", "상태", "비고", "등록일시"],
+        "dates": [], "nums": [],
+    },
+    "budgets": {
+        "label": "예산", "key": ["연도", "현장"], "cache": True, "legacy": None,
+        "cols": ["연도", "현장", "예산액", "비고"], "dates": [], "nums": ["연도", "예산액"],
+    },
+    "rentals": {
+        "label": "장비대여", "key": ["대여번호"], "cache": True, "legacy": None,
+        "cols": ["대여번호", "상태", "태그번호", "품명", "현장", "신청자", "신청자명", "부서", "시작일", "반납예정일",
+                 "사용목적", "신청일시", "승인자", "승인일시", "대여일시", "반납일시", "반납상태", "메모", "처리이력"],
+        "dates": ["시작일", "반납예정일"], "nums": [],
+    },
+    "attachments": {
+        "label": "첨부파일", "key": ["첨부번호"], "cache": False, "legacy": None,
+        "cols": ["첨부번호", "대상", "대상번호", "파일명", "저장명", "형식", "크기", "설명", "등록자", "등록일시"],
+        "dates": [], "nums": ["크기"], "index": [["대상", "대상번호"]],
+    },
+    "maint_plans": {
+        "label": "점검계획", "key": ["계획번호"], "cache": True, "legacy": None,
+        "cols": ["계획번호", "태그번호", "점검명", "구분", "주기개월", "최근점검일", "다음점검일", "담당업체", "활성", "비고"],
+        "dates": ["최근점검일", "다음점검일"], "nums": ["주기개월"],
+    },
+    "maint_logs": {
+        "label": "점검수리기록", "key": ["기록번호"], "cache": True, "legacy": None,
+        "cols": ["기록번호", "태그번호", "일자", "구분", "내용", "업체", "비용", "결과", "계획번호", "등록자", "등록일시"],
+        "dates": ["일자"], "nums": ["비용"],
+    },
+    "licenses": {
+        "label": "라이선스", "key": ["라이선스번호"], "cache": True, "legacy": None,
+        "cols": ["라이선스번호", "소프트웨어명", "에디션", "유형", "보유수량", "계약일", "만료일", "갱신비용", "공급업체",
+                 "연결태그", "현장", "상태", "비고"],
+        "dates": ["계약일", "만료일"], "nums": ["보유수량", "갱신비용"],
+    },
+    "license_assign": {
+        "label": "라이선스할당", "key": ["할당번호"], "cache": True, "legacy": None,
+        "cols": ["할당번호", "라이선스번호", "사용자", "사번", "부서", "현장", "PC태그", "할당일", "해제일", "상태"],
+        "dates": ["할당일", "해제일"], "nums": [],
+    },
+    "leases": {
+        "label": "렌탈리스", "key": ["계약번호"], "cache": True, "legacy": None,
+        "cols": ["계약번호", "구분", "품명", "규격", "현장", "업체", "시작일", "종료일", "월요금", "보증금", "자동연장",
+                 "담당", "상태", "연결차량번호", "비고"],
+        "dates": ["시작일", "종료일"], "nums": ["월요금", "보증금"],
+    },
+    "capex": {
+        "label": "자본적지출", "key": ["번호"], "cache": True, "legacy": None,
+        "cols": ["번호", "태그번호", "일자", "내용", "금액", "연장연수", "등록자", "등록일시"],
+        "dates": ["일자"], "nums": ["금액", "연장연수"],
+    },
+    "dsp_votes": {
+        "label": "위원회투표", "key": ["요청번호", "위원"], "cache": True, "legacy": None,
+        "cols": ["요청번호", "위원", "위원명", "결과", "의견", "일시"],
+        "dates": [], "nums": [],
+    },
+    "vehicle_km": {
+        "label": "차량월별KM", "key": ["차량번호", "연월"], "cache": True, "legacy": None,
+        "cols": ["차량번호", "연월", "km"], "dates": [], "nums": ["km"],
+    },
+    "notify_log": {
+        "label": "알림발송기록", "key": None, "cache": False, "legacy": None,
+        "cols": ["일시", "채널", "수신", "건수", "결과"], "dates": [], "nums": ["건수"],
     },
 }
 for _spec in TABLES.values():
@@ -236,11 +342,11 @@ def to_num(value, default=None):
 
 
 def today() -> date:
-    return date.today()
+    return datetime.now(KST).date()
 
 
 def now_text() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M")
+    return datetime.now(KST).strftime("%Y-%m-%d %H:%M")
 
 
 def _q(name: str) -> str:
@@ -486,6 +592,13 @@ _HEADER_FILL = PatternFill("solid", fgColor="5B9BD5")
 _HEADER_FONT = Font(color="FFFFFF", bold=True, size=10)
 
 
+def _safe_cell(value):
+    """엑셀이 수식으로 실행하지 않도록 =, +, -, @ 로 시작하는 글자 앞에 ' 를 붙입니다(수식 주입 방지)."""
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@"):
+        return "'" + value
+    return value
+
+
 def rows_to_xlsx(sheets: dict[str, tuple[list[str], list[dict]]]) -> bytes:
     """{시트명: (열 목록, 행 목록)} → xlsx. write_only 모드라 수십만 행도 처리합니다."""
     wb = Workbook(write_only=True)
@@ -502,7 +615,7 @@ def rows_to_xlsx(sheets: dict[str, tuple[list[str], list[dict]]]) -> bytes:
             header.append(cell)
         ws.append(header)
         for r in rows:
-            ws.append([None if r.get(c) == "" else r.get(c) for c in cols])
+            ws.append([None if r.get(c) == "" else _safe_cell(r.get(c)) for c in cols])
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -513,7 +626,7 @@ def rows_to_csv(cols: list[str], rows: list[dict]) -> bytes:
     w = csv.writer(buf)
     w.writerow(cols)
     for r in rows:
-        w.writerow(["" if r.get(c) is None else r.get(c) for c in cols])
+        w.writerow(["" if r.get(c) is None else _safe_cell(r.get(c)) for c in cols])
     return ("﻿" + buf.getvalue()).encode("utf-8")  # 엑셀에서 한글이 깨지지 않도록 BOM
 
 
@@ -563,6 +676,10 @@ def save_settings(values: dict):
     upsert("settings", rows)
 
 
+def setting_num(key: str, default: int = 0) -> int:
+    return to_num(get_settings().get(key), default) or default
+
+
 def get_sites() -> list[dict]:
     return sorted(load("sites"), key=lambda s: (s.get("표시순서") or 999, s["현장명"]))
 
@@ -605,69 +722,125 @@ def months_used(acquired, as_of: date) -> int:
     return max(0, (as_of.year - acquired.year) * 12 + (as_of.month - acquired.month) + 1)
 
 
-def asset_life(asset: dict) -> int:
+def asset_life(asset: dict, basis: str = "회계") -> int:
+    if basis == "세무":
+        tl = asset.get("세무 내용연수")
+        if isinstance(tl, (int, float)) and tl:
+            return int(tl)
     life = asset.get("내용연수")
     if isinstance(life, (int, float)) and life:
         return int(life)
     return int(to_num(life, None) or account_info(asset)["life"] or 0)
 
 
-def asset_method(asset: dict) -> str:
+def asset_method(asset: dict, basis: str = "회계") -> str:
+    if basis == "세무" and clean_str(asset.get("세무 상각방법")):
+        return clean_str(asset.get("세무 상각방법"))
     return clean_str(asset.get("상각방법")) or account_info(asset)["method"]
 
 
-def accumulated_at(asset: dict, months: int) -> float:
-    """취득 후 months개월 동안의 상각누계액.
+def _accum(cost: float, cls: str, life: int, method: str, residual: float, months: int, memo: bool = True) -> float:
+    """상각누계액 계산 공통식.
 
     - 소모품: 취득 시 전액 비용 처리(누계액 = 취득가액)
     - 정액법: (취득가액 - 잔존가액) × 경과월 / 내용연수월
     - 정률법: 세법 방식. 잔존가치 5%로 상각률 r = 1 - 0.05^(1/n), 연 단위 체감 + 연중 월할
-    - 내용연수 종료 시 유형자산은 비망가액 1,000원(또는 잔존가액)만 남깁니다.
+    - 내용연수 종료 시 유형자산은 비망가액 1,000원(또는 잔존가액)만 남깁니다(memo=False면 0원까지).
     """
-    info = account_info(asset)
-    cost = asset.get("취득가액")
-    cost = float(cost if isinstance(cost, (int, float)) else (to_num(cost, 0) or 0))
     if cost <= 0:
         return 0.0
-    life = asset_life(asset)
-    if info["cls"] == "소모품" or life <= 0:
+    if cls == "소모품" or life <= 0:
         return cost
     if months <= 0:
         return 0.0
-    residual = asset.get("잔존가액") or 0
-    residual = float(residual if isinstance(residual, (int, float)) else (to_num(residual, 0) or 0))
-    floor = max(residual, min(0.0 if info["cls"] == "무형자산" else 1000.0, cost))
+    floor = max(residual, min(0.0 if (cls == "무형자산" or not memo) else 1000.0, cost))
     total_months = life * 12
     if months >= total_months:
         return cost - floor
-    if asset_method(asset) == "정률":
+    if method == "정률":
         rate = 1 - (max(residual, cost * 0.05) / cost) ** (1 / life)
         years, rest = divmod(months, 12)
         return min(cost - floor, cost - cost * (1 - rate) ** years * (1 - rate * rest / 12))
     return min(cost - floor, (cost - residual) * months / total_months)
 
 
-def depreciation(asset: dict, as_of: date | None = None) -> dict:
-    """기준일(as_of) 시점의 경과월, 상각누계액, 장부가액, 해당 월 상각비."""
+def _num(v) -> float:
+    return float(v if isinstance(v, (int, float)) else (to_num(v, 0) or 0))
+
+
+def accumulated_at(asset: dict, months: int, basis: str = "회계") -> float:
+    """자산 본체(자본적 지출 제외)의 취득 후 months개월 상각누계액."""
+    return _accum(_num(asset.get("취득가액")), account_info(asset)["cls"], asset_life(asset, basis),
+                  asset_method(asset, basis), _num(asset.get("잔존가액") or 0), months)
+
+
+def capex_of(tag: str) -> list[dict]:
+    """자산의 자본적 지출(개량·증설) 목록."""
+    def build():
+        out: dict[str, list[dict]] = {}
+        for c in load("capex"):
+            out.setdefault(c["태그번호"], []).append(c)
+        for v in out.values():
+            v.sort(key=lambda c: c["일자"] or date.min)
+        return out
+    if not clean_str(tag):
+        return []  # 저장되지 않은 자산(계산 미리보기·단위 테스트)은 자본적 지출이 없습니다
+    key = ("capex", data_version("capex"))
+    idx = _derived.get(key)
+    if idx is None:
+        with _lock:
+            for k in [k for k in _derived if k[0] == "capex"]:
+                _derived.pop(k, None)
+            idx = build()
+            _derived[key] = idx
+    return idx.get(tag, [])
+
+
+def _capex_life(asset: dict, c: dict, basis: str) -> int:
+    """자본적 지출 부분의 내용연수 = 지출 시점 자산의 남은 내용연수(올림) + 연장연수."""
+    life = asset_life(asset, basis)
+    remain = life * 12 - months_used(asset.get("취득일자"), c["일자"]) + 1
+    return max(1, -(-max(remain, 0) // 12)) + int(c.get("연장연수") or 0)
+
+
+def depreciation(asset: dict, as_of: date | None = None, basis: str = "회계") -> dict:
+    """기준일(as_of) 시점의 경과월, 상각누계액, 장부가액, 해당 월 상각비.
+
+    자본적 지출은 지출일부터 별도 구성요소로 상각해 더합니다. basis="세무"면 세무 내용연수·방법을 씁니다.
+    """
     as_of = as_of or today()
     disposed = asset.get("처분일자")
     if disposed and disposed < as_of:
         as_of = disposed
     m = months_used(asset.get("취득일자"), as_of)
-    accum = accumulated_at(asset, m)
-    cost = float(to_num(asset.get("취득가액"), 0) or 0)
-    return {"months": m, "accum": accum, "nbv": cost - accum, "monthly": accum - accumulated_at(asset, m - 1)}
+    accum = accumulated_at(asset, m, basis)
+    prev = accumulated_at(asset, m - 1, basis)
+    cost = _num(asset.get("취득가액"))
+    cls = account_info(asset)["cls"]
+    for c in capex_of(asset.get("태그번호", "")):
+        if not c["일자"] or c["일자"] > as_of:
+            continue
+        amount = _num(c["금액"])
+        life_c = _capex_life(asset, c, basis)
+        mc = months_used(c["일자"], as_of)
+        method = asset_method(asset, basis)
+        accum += _accum(amount, cls, life_c, method, 0.0, mc, memo=False)
+        prev += _accum(amount, cls, life_c, method, 0.0, mc - 1, memo=False)
+        cost += amount
+    return {"months": m, "accum": accum, "nbv": cost - accum, "monthly": accum - prev, "cost": cost}
 
 
 def _derived_get(name: str, builder, *extra):
-    key = (name, data_version("assets"), *extra)
-    value = _derived.get(key)
-    if value is None:
-        for k in [k for k in _derived if k[0] == name and k[1] != key[1]]:
-            _derived.pop(k, None)
-        value = builder()
-        _derived[key] = value
-    return value
+    with _lock:  # 여러 사용자가 동시에 같은 계산을 해도 안전하도록
+        ver = (data_version("assets"), data_version("capex"))
+        key = (name, ver, *extra)
+        value = _derived.get(key)
+        if value is None:
+            for k in [k for k in _derived if k[0] == name and k[1] != ver]:
+                _derived.pop(k, None)
+            value = builder()
+            _derived[key] = value
+        return value
 
 
 def _nbv_map() -> dict:
@@ -688,15 +861,16 @@ def life_remaining_months(asset: dict) -> int | None:
     life = asset_life(asset)
     if account_info(asset)["cls"] == "소모품" or life <= 0:
         return None
-    return life * 12 - months_used(asset.get("취득일자"), today())
+    extend = sum(int(c.get("연장연수") or 0) for c in capex_of(asset.get("태그번호", "")))
+    return (life + extend) * 12 - months_used(asset.get("취득일자"), today())
 
 
-def depreciation_schedule(year: int, month: int, site: str | None = None) -> list[dict]:
-    """결산월 기준 고정자산 명세(소모품 제외)."""
-    return _derived_get("sched", lambda: _build_schedule(year, month, site), year, month, site or "")
+def depreciation_schedule(year: int, month: int, site: str | None = None, basis: str = "회계") -> list[dict]:
+    """결산월 기준 고정자산 명세(소모품 제외). basis: 회계 또는 세무."""
+    return _derived_get("sched", lambda: _build_schedule(year, month, site, basis), year, month, site or "", basis)
 
 
-def _build_schedule(year: int, month: int, site: str | None) -> list[dict]:
+def _build_schedule(year: int, month: int, site: str | None, basis: str = "회계") -> list[dict]:
     period_end = date(year, month, 28) + timedelta(days=4)
     period_end = period_end - timedelta(days=period_end.day)
     year_start, prev_end = date(year, 1, 1), date(year - 1, 12, 31)
@@ -710,16 +884,18 @@ def _build_schedule(year: int, month: int, site: str | None) -> list[dict]:
         acquired = a["취득일자"]
         if not acquired or acquired > period_end:
             continue
-        end = depreciation(a, period_end)
-        prev = depreciation(a, prev_end) if acquired <= prev_end else {"accum": 0.0, "nbv": 0.0}
+        end = depreciation(a, period_end, basis)
+        prev = depreciation(a, prev_end, basis) if acquired <= prev_end else {"accum": 0.0, "nbv": 0.0, "cost": 0.0}
         gone = bool(disposed and disposed <= period_end)
-        cost = float(a["취득가액"] or 0)
-        life = asset_life(a)
+        base_cost = _num(a["취득가액"])
+        capex_total = end["cost"] - base_cost
+        life = asset_life(a, basis)
         rows.append({
             "태그번호": a["태그번호"], "품명": a["품명"], "계정과목": a["계정과목"], "현장": a["현장"],
-            "취득일자": acquired, "취득가액": cost, "내용연수": life, "상각방법": asset_method(a),
+            "취득일자": acquired, "취득가액": end["cost"], "자본적지출": capex_total, "내용연수": life,
+            "상각방법": asset_method(a, basis),
             "기초 장부가": prev["nbv"] if acquired <= prev_end else 0.0,
-            "당기 취득": cost if acquired >= year_start else 0.0,
+            "당기 취득": (end["cost"] if acquired >= year_start else end["cost"] - prev["cost"]),
             "당기 상각비": end["accum"] - prev["accum"],
             "월 상각비": 0.0 if gone else end["monthly"],
             "상각누계액": 0.0 if gone else end["accum"],
@@ -729,6 +905,45 @@ def _build_schedule(year: int, month: int, site: str | None) -> list[dict]:
         })
     rows.sort(key=lambda r: (ACCOUNT_NAMES.index(r["계정과목"]) if r["계정과목"] in ACCOUNT_NAMES else 99, r["태그번호"]))
     return rows
+
+
+def tax_adjustment(year: int, month: int, site: str | None = None) -> list[dict]:
+    """회계 상각비와 세법 상각한도의 차이(세무조정). 차이가 있는 자산만."""
+    book = {r["태그번호"]: r for r in depreciation_schedule(year, month, site, "회계")}
+    tax = {r["태그번호"]: r for r in depreciation_schedule(year, month, site, "세무")}
+    out = []
+    for tag, b in book.items():
+        t = tax.get(tag)
+        if not t:
+            continue
+        diff = b["당기 상각비"] - t["당기 상각비"]
+        if abs(diff) < 1:
+            continue
+        out.append({"태그번호": tag, "품명": b["품명"], "계정과목": b["계정과목"], "현장": b["현장"],
+                    "회계 내용연수": b["내용연수"], "세무 내용연수": t["내용연수"],
+                    "회계 상각비": round(b["당기 상각비"]), "세법 상각한도": round(t["당기 상각비"]),
+                    "상각부인액": round(max(diff, 0)), "시인부족액": round(max(-diff, 0))})
+    return out
+
+
+def depreciation_forecast(years: int = 3) -> list[dict]:
+    """보유 자산 기준 앞으로 years년 동안의 연도별·계정별 감가상각비 예측(새로 살 자산은 제외)."""
+    def build():
+        y0 = today().year
+        rows = []
+        for a in active_assets():
+            if a["계정과목"] == "소모품":
+                continue
+            prev = depreciation(a, date(y0 - 1, 12, 31))["accum"] if a["취득일자"] and a["취득일자"].year < y0 else 0.0
+            for y in range(y0, y0 + years):
+                end = depreciation(a, date(y, 12, 31))["accum"]
+                rows.append((y, a["계정과목"], a["현장"], end - prev))
+                prev = end
+        agg: dict[tuple, float] = {}
+        for y, acc, site, v in rows:
+            agg[(y, acc, site)] = agg.get((y, acc, site), 0.0) + v
+        return [{"연도": y, "계정과목": acc, "현장": site, "상각비": round(v)} for (y, acc, site), v in sorted(agg.items())]
+    return _derived_get("forecast", build, years, today().year)
 
 
 # =========================================================
@@ -1008,6 +1223,38 @@ def _new_request(kind: str, fields: dict) -> dict:
 # =========================================================
 # 1. 구매요청 → 견적 → 발주 → 검수 → 등록
 # =========================================================
+APPROVAL_LEVELS = ["현장책임자", "자산관리자", "임원"]
+
+
+def approval_line(amount: float) -> list[str]:
+    """구매 총액에 따른 결재선(전결 규정). 기준 금액은 설정에서 바꿉니다."""
+    t1, t2 = setting_num("결재 기준1", 1_000_000), setting_num("결재 기준2", 10_000_000)
+    if amount < t1:
+        return APPROVAL_LEVELS[:1]
+    if amount < t2:
+        return APPROVAL_LEVELS[:2]
+    return APPROVAL_LEVELS[:]
+
+
+def pr_amount(rec: dict) -> float:
+    qty = to_num(rec.get("수량"), 0) or 0
+    unit = to_num(rec.get("선정단가")) or to_num(rec.get("예상단가"), 0) or 0
+    return qty * unit
+
+
+def pr_line(rec: dict) -> list[str]:
+    return [x for x in clean_str(rec.get("결재선")).split(",") if x] or APPROVAL_LEVELS[1:2]
+
+
+def pr_current_level(rec: dict) -> str | None:
+    """구매요청이 지금 누구의 결재를 기다리는지 (요청 상태일 때만)."""
+    if rec.get("상태") != "요청":
+        return None
+    line = pr_line(rec)
+    step = int(to_num(rec.get("결재단계"), 0) or 0)
+    return line[step] if step < len(line) else None
+
+
 def create_purchase_request(fields: dict, actor: str) -> str:
     for key, label in (("품명", "품명"), ("구매사유", "구매 사유")):
         if not clean_str(fields.get(key)):
@@ -1019,20 +1266,36 @@ def create_purchase_request(fields: dict, actor: str) -> str:
     with _lock:
         no = _next_no("pr")
         rec = _new_request("pr", fields)
-        rec.update({"요청번호": no, "상태": "요청", "요청일시": now_text(), "요청자": actor})
-        _append_log(rec, "구매요청", actor, clean_str(fields.get("구매사유"))[:60])
+        rec.update({"요청번호": no, "상태": "요청", "요청일시": now_text(), "요청자": actor, "입고누계": 0, "결재단계": 0})
+        line = approval_line(pr_amount(rec))
+        rec["결재선"] = ",".join(line)
+        _append_log(rec, "구매요청", actor, f"결재선: {' → '.join(line)} · {clean_str(fields.get('구매사유'))[:50]}")
         upsert("pr", [rec])
     return no
 
 
 def pr_decide(no: str, approve: bool, note: str, actor: str):
+    """현재 결재 단계 승인(마지막 단계면 '승인'으로) 또는 반려."""
     if not approve and not clean_str(note):
         raise DataError("반려 사유를 입력하세요.")
 
     def mutate(rec):
-        rec["상태"] = "승인" if approve else REJECTED
-        rec["검토의견"] = note
-        _append_log(rec, "타당성 승인" if approve else "반려", actor, note)
+        level = pr_current_level(rec) or "자산관리자"
+        line = pr_line(rec)
+        if not approve:
+            rec["상태"] = REJECTED
+            rec["검토의견"] = note
+            _append_log(rec, f"반려({level})", actor, note)
+            return
+        step = int(to_num(rec.get("결재단계"), 0) or 0) + 1
+        rec["결재단계"] = step
+        if note:
+            rec["검토의견"] = (rec["검토의견"] + " / " if rec["검토의견"] else "") + f"{level}: {note}"
+        if step >= len(line):
+            rec["상태"] = "승인"
+            _append_log(rec, f"최종 승인({level})", actor, note)
+        else:
+            _append_log(rec, f"{step}차 승인({level}) → 다음: {line[step]}", actor, note)
     _update_request("pr", no, ["요청"], mutate)
 
 
@@ -1071,20 +1334,30 @@ def pr_choose_vendor(no: str, slot: int, reason: str, actor: str):
             raise DataError("선정할 견적을 고르세요.")
         if not clean_str(reason):
             raise DataError("선정 사유를 입력하세요.")
-        rec.update({"선정업체": chosen["업체"], "선정단가": chosen["단가"], "선정사유": reason, "상태": "발주"})
+        rec.update({"선정업체": chosen["업체"], "선정단가": chosen["단가"], "선정사유": reason, "상태": "발주",
+                    "발주일시": now_text()})
         _append_log(rec, "업체 선정·발주", actor, f"{chosen['업체']} {int(chosen['단가']):,}원 · {reason}")
     _update_request("pr", no, ["승인"], mutate)
 
 
+def pr_remaining(rec: dict) -> int:
+    """아직 입고·등록되지 않은 수량."""
+    return int(to_num(rec.get("수량"), 0) or 0) - int(to_num(rec.get("입고누계"), 0) or 0)
+
+
 def pr_inspect(no: str, spec_ok: bool, received_qty: int, no_damage: bool, serials: str, note: str, actor: str) -> bool:
+    """입고 검수. 남은 수량보다 적게 들어와도(부분 입고) 규격·파손이 맞으면 그만큼 합격 처리합니다."""
     def mutate(rec):
-        qty_ok = int(received_qty or 0) == int(to_num(rec["수량"], 0) or 0)
+        remaining = pr_remaining(rec)
+        n = int(received_qty or 0)
+        qty_ok = 0 < n <= remaining
         passed = spec_ok and no_damage and qty_ok
-        rec.update({"검수 규격": "적합" if spec_ok else "부적합", "검수 입고수량": int(received_qty or 0),
+        rec.update({"검수 규격": "적합" if spec_ok else "부적합", "검수 입고수량": n,
                     "검수 파손": "이상 없음" if no_damage else "파손 있음", "검수 시리얼": clean_str(serials),
                     "검수 메모": note, "검수자": actor, "검수일시": now_text(), "상태": "검수완료" if passed else "발주"})
-        fails = [x for x, ok in (("규격", spec_ok), ("수량", qty_ok), ("파손", no_damage)) if not ok]
-        _append_log(rec, "검수 합격" if passed else "검수 부적합(재입고 후 재검수)", actor, note or ", ".join(fails))
+        fails = [x for x, ok in (("규격", spec_ok), (f"수량(남은 {remaining}개)", qty_ok), ("파손", no_damage)) if not ok]
+        part = f" (부분 입고 {n}/{remaining})" if passed and n < remaining else ""
+        _append_log(rec, ("검수 합격" + part) if passed else "검수 부적합(재입고 후 재검수)", actor, note or ", ".join(fails))
         return passed
     return _update_request("pr", no, ["발주"], mutate)
 
@@ -1094,13 +1367,16 @@ def pr_register(no: str, asset_fields: dict, actor: str) -> list[str]:
     if not rec or rec["상태"] != "검수완료":
         raise DataError("검수가 끝난 요청만 자산대장에 등록할 수 있습니다.")
     serials = [s.strip() for s in clean_str(rec["검수 시리얼"]).split(",") if s.strip()]
-    tags = register_assets(asset_fields, int(to_num(rec["수량"], 1) or 1), actor, serials=serials, pr_no=no,
+    n = int(to_num(rec["검수 입고수량"], 0) or 0) or pr_remaining(rec)
+    tags = register_assets(asset_fields, n, actor, serials=serials, pr_no=no,
                            history_text=f"구매요청 {no} · {rec['선정업체']} 입고 검수 후 등록")
 
     def mutate(r):
-        r["상태"] = "등록완료"
-        r["등록 태그번호"] = ", ".join(tags)
-        _append_log(r, "자산 등록", actor, ", ".join(tags))
+        r["입고누계"] = int(to_num(r.get("입고누계"), 0) or 0) + len(tags)
+        r["등록 태그번호"] = ", ".join(t for t in [r["등록 태그번호"], ", ".join(tags)] if t)
+        done = r["입고누계"] >= int(to_num(r["수량"], 0) or 0)
+        r["상태"] = "등록완료" if done else "발주"
+        _append_log(r, "자산 등록" + ("" if done else f" (남은 {pr_remaining(r)}개 입고 대기)"), actor, ", ".join(tags))
     _update_request("pr", no, ["검수완료"], mutate)
     return tags
 
@@ -1173,6 +1449,42 @@ def transfer_receive(no: str, note: str, actor: str):
 # =========================================================
 # 3. 분실·도난·파손
 # =========================================================
+def open_incident(tag: str) -> dict | None:
+    return next((r for r in load("inc") if r["태그번호"] == tag and is_open("inc", r)), None)
+
+
+def request_statement(tag: str, reason: str, actor: str) -> str | None:
+    """재물조사 미발견·퇴사자 미반납 등으로 현장 담당자에게 분실 경위서를 요청합니다(이미 진행 중이면 생략)."""
+    a = get_asset(tag)
+    if not a or not is_active(a) or open_incident(tag):
+        return None
+    with _lock:
+        no = _next_no("inc")
+        rec = _new_request("inc", {"요청번호": no, "상태": "경위요청", "요청일시": now_text(), "신고자": actor,
+                                   "태그번호": a["태그번호"], "품명": a["품명"], "현장": a["현장"], "구분": "분실",
+                                   "발생일": today(), "경위": ""})
+        _append_log(rec, "경위서 요청", actor, reason)
+        upsert("inc", [rec])
+    add_history(tag, "경위서 요청", reason, actor)
+    return no
+
+
+def submit_statement(no: str, kind: str, occurred, place: str, person: str, statement: str, police: str, actor: str):
+    """요청받은 경위서를 작성해 접수합니다."""
+    if not clean_str(statement):
+        raise DataError("경위를 입력하세요.")
+
+    def mutate(rec):
+        rec.update({"구분": kind, "발생일": to_date(occurred) or today(), "발생장소": place, "관련자": person,
+                    "경위": statement, "경찰신고번호": police, "상태": "접수", "신고자": actor})
+        _append_log(rec, f"{kind} 경위서 작성·접수", actor)
+        return rec
+    rec = _update_request("inc", no, ["경위요청"], mutate)
+    a = get_asset(rec["태그번호"])
+    if a and kind == "파손" and a["상태"] != "수리중":
+        update_asset(a["태그번호"], {"상태": "수리중", "이전상태": a["상태"]}, actor, "사고 접수", f"{kind} ({no})")
+
+
 def create_incident(tag: str, kind: str, occurred, place: str, person: str, statement: str,
                     police: str, actor: str) -> str:
     a = get_asset(tag)
@@ -1180,6 +1492,8 @@ def create_incident(tag: str, kind: str, occurred, place: str, person: str, stat
         raise DataError("신고할 수 있는 자산이 아닙니다.")
     if not clean_str(statement):
         raise DataError("경위를 입력하세요.")
+    if open_incident(tag):
+        raise DataError(f"{tag}은(는) 이미 진행 중인 분실·파손 건({open_incident(tag)['요청번호']})이 있습니다.")
     with _lock:
         no = _next_no("inc")
         rec = _new_request("inc", {"요청번호": no, "상태": "접수", "요청일시": now_text(), "신고자": actor,
@@ -1227,6 +1541,10 @@ def incident_close(no: str, actor: str) -> str:
         restore = a["이전상태"] if a["이전상태"] and a["이전상태"] not in CLOSED_STATUSES else "사용중"
         update_asset(a["태그번호"], {"상태": restore, "이전상태": ""}, actor, "사고 종결", f"{action} ({no})")
         message = f"{a['태그번호']}을(를) '{restore}' 상태로 되돌렸습니다."
+        if action == "수리" and to_num(rec["수리견적"]):
+            add_maint_log({"태그번호": a["태그번호"], "일자": today(), "구분": "수리", "내용": f"{rec['구분']} 수리 ({no})",
+                           "비용": to_num(rec["수리견적"]), "결과": "정상"}, actor)
+            message += " 수리비를 점검·수리 기록에 남겼습니다."
 
     def mutate(r):
         r["상태"] = "종결"
@@ -1253,11 +1571,157 @@ def disposal_candidates(site: str | None = None) -> list[dict]:
         repair = a["수리견적"] or 0
         if repair and repair > book_value(a):
             reasons.append(f"수리비 {int(repair):,}원 > 장부가")
+        total_repair = repair_costs().get(a["태그번호"], 0)
+        if total_repair and total_repair > book_value(a) and not repair:
+            reasons.append(f"누적 수리비 {int(total_repair):,}원 > 장부가")
         if a["상태"] == "유휴" and left is not None and 0 < left <= 12:
             reasons.append("유휴 · 1년 내 만료")
         if reasons:
             out.append({**a, "장부가액": book_value(a), "검토사유": " / ".join(reasons)})
     return out
+
+
+def next_code(table: str, keycol: str, prefix: str) -> str:
+    """접두어-연월-일련번호 형식의 새 번호 (예: RT-2610-001)."""
+    p = f"{prefix}-{today():%y%m}-"
+    used = [int(r[keycol][len(p):]) for r in load(table) if r[keycol].startswith(p) and r[keycol][len(p):].isdigit()]
+    return f"{p}{max(used, default=0) + 1:03d}"
+
+
+def next_code_query(table: str, keycol: str, prefix: str) -> str:
+    """캐시하지 않는 표(첨부 등)용 새 번호."""
+    p = f"{prefix}-{today():%y%m}-"
+    n = scalar(f"SELECT MAX(CAST(substr({_q(keycol)}, ?) AS INTEGER)) FROM {table} WHERE {_q(keycol)} LIKE ?", (len(p) + 1, p + "%"))
+    return f"{p}{(n or 0) + 1:03d}"
+
+
+def add_maint_log(fields: dict, actor: str) -> str:
+    """점검·법정검사·수리 기록. 점검 계획에 연결되면 다음 점검일을 자동으로 미룹니다."""
+    tag = clean_str(fields.get("태그번호"))
+    if not get_asset(tag):
+        raise DataError("자산을 찾을 수 없습니다.")
+    when = to_date(fields.get("일자")) or today()
+    with _lock:
+        no = next_code("maint_logs", "기록번호", "ML")
+        rec = {c: "" for c in TABLES["maint_logs"]["cols"]}
+        rec.update({k: v for k, v in fields.items() if k in rec})
+        rec.update({"기록번호": no, "태그번호": tag, "일자": when, "등록자": actor, "등록일시": now_text()})
+        upsert("maint_logs", [rec])
+        plan = lookup("maint_plans", clean_str(fields.get("계획번호"))) if fields.get("계획번호") else None
+        if plan:
+            months = int(plan["주기개월"] or 12)
+            upsert("maint_plans", [dict(plan, 최근점검일=when, 다음점검일=_shift_months_exact(when, months))])
+    cost = to_num(fields.get("비용"), 0) or 0
+    add_history(tag, rec["구분"] or "점검", f"{rec['내용']}" + (f" · {int(cost):,}원" if cost else ""), actor)
+    return no
+
+
+def _shift_months_exact(d: date, months: int) -> date:
+    y, m = divmod(d.month - 1 + months, 12)
+    y, m = d.year + y, m + 1
+    last = (date(y + (m // 12), m % 12 + 1, 1) - timedelta(days=1)).day
+    return date(y, m, min(d.day, last))
+
+
+def repair_costs() -> dict[str, float]:
+    """자산별 누적 수리비."""
+    key = ("repair", data_version("maint_logs"))
+    m = _derived.get(key)
+    if m is None:
+        m = {}
+        for r in load("maint_logs"):
+            if r["구분"] == "수리" and r["비용"]:
+                m[r["태그번호"]] = m.get(r["태그번호"], 0) + r["비용"]
+        with _lock:
+            for k in [k for k in _derived if k[0] == "repair"]:
+                _derived.pop(k, None)
+            _derived[key] = m
+    return m
+
+
+# ---- 매각 입찰 ----
+def dsp_bids(rec: dict) -> list[dict]:
+    out = []
+    for i in (1, 2, 3):
+        buyer = clean_str(rec.get(f"입찰{i} 매수자"))
+        if buyer:
+            out.append({"slot": i, "매수자": buyer, "금액": to_num(rec.get(f"입찰{i} 금액"), 0) or 0,
+                        "조건": clean_str(rec.get(f"입찰{i} 조건"))})
+    return out
+
+
+def dsp_save_bids(no: str, bids: list[dict], actor: str):
+    valid = [b for b in bids if clean_str(b.get("매수자"))]
+    if not valid:
+        raise DataError("매수자를 한 곳 이상 입력하세요.")
+
+    def mutate(rec):
+        for i in (1, 2, 3):
+            b = valid[i - 1] if i <= len(valid) else {}
+            rec[f"입찰{i} 매수자"] = clean_str(b.get("매수자"))
+            rec[f"입찰{i} 금액"] = to_num(b.get("금액"))
+            rec[f"입찰{i} 조건"] = clean_str(b.get("조건"))
+        _append_log(rec, "매각 입찰 등록", actor, ", ".join(f"{b['매수자']} {int(to_num(b.get('금액'), 0) or 0):,}원" for b in valid))
+    _update_request("dsp", no, ["승인"], mutate)
+
+
+def dsp_award(no: str, slot: int, actor: str):
+    """최고가(또는 선택한) 매수자를 낙찰자로 정합니다. 집행 때 처분처·금액으로 쓰입니다."""
+    def mutate(rec):
+        bid = next((b for b in dsp_bids(rec) if b["slot"] == slot), None)
+        if not bid:
+            raise DataError("낙찰할 입찰을 고르세요.")
+        rec["낙찰자"], rec["낙찰금액"] = bid["매수자"], bid["금액"]
+        _append_log(rec, "낙찰", actor, f"{bid['매수자']} {int(bid['금액']):,}원")
+    _update_request("dsp", no, ["승인"], mutate)
+
+
+# ---- 불용품 판정 위원회 ----
+def dsp_votes(no: str) -> list[dict]:
+    return sorted([v for v in load("dsp_votes") if v["요청번호"] == no], key=lambda v: v["일시"])
+
+
+def vote_summary(no: str) -> dict:
+    votes = dsp_votes(no)
+    yes = sum(1 for v in votes if v["결과"] == "찬성")
+    no_ = sum(1 for v in votes if v["결과"] == "반대")
+    return {"votes": votes, "yes": yes, "no": no_, "quorum": setting_num("위원회 정족수", 2)}
+
+
+def cast_votes(no: str, votes: list[dict], actor: str, minutes: str = "") -> str:
+    """위원 투표를 기록하고 정족수에 이르면 승인·반려를 확정합니다.
+
+    votes: [{"위원": 아이디, "위원명": 이름, "결과": "찬성"|"반대", "의견": str}]
+    돌려주는 값: "승인", "반려" 또는 "진행중"
+    """
+    rec = get_request("dsp", no)
+    if not rec or rec["상태"] != "신청":
+        raise DataError("위원회 심의 중인 처분 신청이 아닙니다.")
+    stamp = now_text()
+    rows = []
+    for v in votes:
+        if v.get("결과") not in ("찬성", "반대"):
+            continue
+        rows.append({"요청번호": no, "위원": clean_str(v.get("위원")), "위원명": clean_str(v.get("위원명")),
+                     "결과": v["결과"], "의견": clean_str(v.get("의견")), "일시": stamp})
+    if not rows:
+        raise DataError("찬성 또는 반대를 고르세요.")
+    upsert("dsp_votes", rows)
+    s = vote_summary(no)
+    note = " / ".join(f"{v['위원명']} {v['결과']}" + (f"({v['의견']})" if v["의견"] else "") for v in s["votes"])
+    if minutes:
+        note = f"{minutes} · {note}"
+    if s["yes"] >= s["quorum"]:
+        disposal_decide(no, True, f"위원회 승인 (찬성 {s['yes']}·반대 {s['no']}) — {note}", actor)
+        return "승인"
+    if s["no"] >= s["quorum"]:
+        disposal_decide(no, False, f"위원회 반려 (찬성 {s['yes']}·반대 {s['no']}) — {note}", actor)
+        return "반려"
+
+    def mutate(r):
+        _append_log(r, "위원 투표", actor, f"찬성 {s['yes']} · 반대 {s['no']} (정족수 {s['quorum']})")
+    _update_request("dsp", no, ["신청"], mutate)
+    return "진행중"
 
 
 def needs_secure_wipe(assets: list[dict]) -> bool:
@@ -1269,11 +1733,14 @@ def create_disposal(tags: list[str], reason: str, method: str, detail: str, acto
         raise DataError("처분할 자산을 고르세요.")
     if not clean_str(detail):
         raise DataError("상세 사유를 입력하세요.")
+    moving = {t for r in load("move") if is_open("move", r) for t in _tags_of(r)}
     groups: dict[str, list[dict]] = {}
     for t in tags:
         a = get_asset(t)
         if not a or a["상태"] not in ("사용중", "유휴", "수리중"):
             raise DataError(f"{t}은(는) 처분 신청할 수 없는 상태입니다.")
+        if t in moving:
+            raise DataError(f"{t}은(는) 진행 중인 이동신청이 있습니다. 이동을 끝내거나 반려한 뒤 처분 신청하세요.")
         groups.setdefault(a["현장"], []).append(a)
     created = []
     with _lock:
@@ -1448,7 +1915,8 @@ def audit_scan(audit_no: str, code: str, actor: str, allowed_site: str | None = 
     return True, f"{item['태그번호']} {item['품명']} 확인"
 
 
-def close_audit(audit_no: str, actor: str) -> dict:
+def close_audit(audit_no: str, actor: str, request_statements: bool = True) -> dict:
+    """조사 마감. 유휴 판정 자산은 '유휴'로 바꾸고, 미발견 자산은 현장 담당자에게 분실 경위서를 요청합니다."""
     items = get_audit_items(audit_no)
     stats = audit_stats(items)
     name = (lookup("audits", audit_no) or {}).get("회차명", audit_no)
@@ -1467,10 +1935,56 @@ def close_audit(audit_no: str, actor: str) -> dict:
     if changes:
         update_assets_bulk(changes, actor, "재물조사", texts)
     add_history_many(hist, actor)
+    requested = 0
+    if request_statements:
+        for r in items:
+            if r["결과"] == "미발견" and request_statement(r["태그번호"], f"{name}: 실물 미발견", actor):
+                requested += 1
     au = dict(lookup("audits", audit_no))
     au.update({"상태": "완료", "마감일시": now_text(), "확인": stats["found"], "미발견": stats["missing"], "유휴": stats["idle"]})
     upsert("audits", [au])
-    return stats
+    return {**stats, "requested": requested}
+
+
+def audit_report(audit_no: str) -> dict:
+    """조사 차이 보고서: 현장별 일치율, 직전 조사 대비 변화, 미발견 자산 목록."""
+    items = get_audit_items(audit_no)
+    audits = [a for a in get_audits() if a["상태"] == "완료" and a["회차번호"] != audit_no]
+    cur = lookup("audits", audit_no) or {}
+    prev = next((a for a in audits if a["시작일시"] < cur.get("시작일시", "")), None)
+    prev_rate = {}
+    if prev:
+        for site, s_ in _site_stats(get_audit_items(prev["회차번호"])).items():
+            prev_rate[site] = s_["rate"]
+    rows = []
+    for site, s_ in sorted(_site_stats(items).items()):
+        rows.append({"현장": site, "장부": s_["total"], "확인": s_["found"], "미발견": s_["missing"], "미확인": s_["todo"],
+                     "유휴": s_["idle"], "일치율(%)": round(s_["rate"], 1),
+                     "직전 대비(%p)": round(s_["rate"] - prev_rate[site], 1) if site in prev_rate else None,
+                     "미발견 장부가": round(sum(book_value(a) for a in (get_asset(r["태그번호"]) for r in items
+                                                                     if r["현장"] == site and r["결과"] == "미발견") if a))})
+    missing = []
+    for r in items:
+        if r["결과"] == "미발견":
+            a = get_asset(r["태그번호"]) or {}
+            missing.append({"태그번호": r["태그번호"], "품명": r["품명"], "현장": r["현장"], "위치": r["설치위치"],
+                            "장부가": round(book_value(a)) if a else 0, "현재상태": a.get("상태", ""),
+                            "경위서": (open_incident(r["태그번호"]) or {}).get("요청번호", "")})
+    return {"sites": rows, "missing": missing, "prev": prev, "total": audit_stats(items)}
+
+
+def _site_stats(items: list[dict]) -> dict:
+    out: dict[str, dict] = {}
+    for r in items:
+        s_ = out.setdefault(r["현장"], {"total": 0, "found": 0, "missing": 0, "idle": 0})
+        s_["total"] += 1
+        s_["found"] += r["결과"] == "확인"
+        s_["missing"] += r["결과"] == "미발견"
+        s_["idle"] += r["유휴"] == "Y"
+    for s_ in out.values():
+        s_["todo"] = s_["total"] - s_["found"] - s_["missing"]
+        s_["rate"] = s_["found"] / s_["total"] * 100 if s_["total"] else 0
+    return out
 
 
 # =========================================================
@@ -1512,13 +2026,13 @@ VEHICLE_COLUMNS = ["차량번호", "차종", "구분", "현장", "사용자", "�
 def vehicle_template_bytes() -> bytes:
     """법인차량 관리 프로그램과 같은 열 구성의 차량목록.xlsx 샘플 양식."""
     sample = [
-        ["12가3456", "그랜저", "구매", "본사", "김대표", "010-1234-5678", "김재열", "010-0000-0000", "운행가능", 48210,
+        ["12가3456", "그랜저", "구매", "본사", "김대표", "010-1234-5678", "홍길동", "010-0000-0000", "운행가능", 48210,
          date(2024, 3, 15), date(2026, 6, 1), None, None, 40000, 50000, "정상", "정상", "정상", "40,500,000원"],
-        ["34나5678", "카니발", "구매", "평택", "이전무", "010-2345-6789", "김재열", "010-0000-0000", "정비중", 103540,
+        ["34나5678", "카니발", "구매", "평택", "이전무", "010-2345-6789", "홍길동", "010-0000-0000", "정비중", 103540,
          date(2022, 11, 2), date(2026, 5, 20), date(2026, 10, 10), date(2026, 10, 20), 80000, 100000, "정상", "교체 대상", "정상", "43,500,000원"],
-        ["56다7890", "쏘렌토", "렌트", "동탄", None, None, "김재열", "010-0000-0000", "운행가능", 35120,
+        ["56다7890", "쏘렌토", "렌트", "동탄", None, None, "홍길동", "010-0000-0000", "운행가능", 35120,
          date(2025, 1, 10), date(2026, 7, 3), None, None, 0, 30000, "정상", "정상", "정상", None],
-        ["78라1234", "스타리아", "렌트", "탕정", None, None, "김재열", "010-0000-0000", "운행가능", 61800,
+        ["78라1234", "스타리아", "렌트", "탕정", None, None, "홍길동", "010-0000-0000", "운행가능", 61800,
          date(2024, 6, 1), date(2026, 4, 11), None, None, 40000, 60000, "정상", "정상", "정상", None],
     ]
     wb = Workbook()
@@ -1705,14 +2219,26 @@ def create_sample_data(actor: str = "예시", active_count: int = 20500, closed_
     for c in TABLES["assets"]["nums"] + TABLES["assets"]["dates"]:
         blank[c] = None
 
+    import ops  # 순환 참조 방지
+    adm = f"{SAMPLE_MARK} 예시 관리자"
+    pool = ops.sample_employees(sites, rnd, max(40, active_count // 25))
+
     def make(acc: str, acquired: date, site: str) -> dict:
         _, name, specs, (lo, hi) = rnd.choice(catalog[acc])
         info = ACCOUNTS[acc]
         rec = dict(blank)
+        emp = rnd.choice(pool[site]) if pool.get(site) and acc not in ("기계장치", "소프트웨어") else None
+        shared = (acc == "공기구비품" and rnd.random() < 0.35) or (name in ("회의실 프로젝터", "노트북") and rnd.random() < 0.04)
+        if shared:
+            emp = None
         rec.update({"태그번호": _next_tags(acc, 1, acquired.year, counters)[0], "품명": name, "규격": rnd.choice(specs),
                     "시리얼번호": "" if acc == "소모품" else f"SN{rnd.randint(10000000, 99999999)}",
-                    "계정과목": acc, "자산구분": info["cls"], "현장": site, "관리부서": rnd.choice(SAMPLE_DEPTS),
-                    "사용자": "" if acc in ("기계장치", "소프트웨어") else rnd.choice(SAMPLE_NAMES),
+                    "계정과목": acc, "자산구분": info["cls"], "현장": site,
+                    "관리부서": emp["부서"] if emp else rnd.choice(SAMPLE_DEPTS),
+                    "사용자": emp["이름"] if emp else "", "사용자사번": emp["사번"] if emp else "",
+                    "공용": "Y" if shared else "",
+                    "보증만료일": acquired + timedelta(days=365 * rnd.choice([1, 2, 3])) if acc in ("비품", "기계장치", "공기구비품", "차량운반구") else None,
+                    "세무 내용연수": 10 if acc == "기계장치" else (4 if acc == "비품" and rnd.random() < 0.1 else None),
                     "설치위치": f"{rnd.randint(1, 5)}층" if acc in ("비품", "소모품") else rnd.choice(["자재창고", "현장사무소", "작업장", "1공구", "2공구"]),
                     "취득일자": acquired, "취득가액": round(rnd.uniform(lo, hi), -3), "내용연수": info["life"],
                     "상각방법": info["method"], "잔존가액": 0,
@@ -1794,23 +2320,29 @@ def create_sample_data(actor: str = "예시", active_count: int = 20500, closed_
     report(0.8, "처분 요청서·자산 이력 저장하는 중")
     insert_bulk("dsp", dsp_rows)
     insert_bulk("history", hist, normalized=True)
+    report(0.85, "업체·예산·점검·라이선스·렌탈·대여 예시 만드는 중")
+    ops.sample_extras(active, sites, rnd, adm, pool)
 
     # 4) 진행 중인 요청·재물조사 (결재 흐름 체험용)
     report(0.9, "진행 중인 요청·재물조사 만드는 중")
     s = (sites + sites)[:4]
     who = lambda name, site: f"{SAMPLE_MARK} {name}({site})"
-    adm = f"{SAMPLE_MARK} 예시 관리자"
-    create_purchase_request({"현장": s[2], "품명": "GPU 워크스테이션", "규격": "RTX 6000 Ada, 128GB", "계정과목": "비품",
-                             "수량": 2, "예상단가": 6800000, "필요일": now + timedelta(days=30),
-                             "구매사유": "신규 시뮬레이션 과제 착수. 기존 워크스테이션은 모두 사용 중"}, who("박민수", s[2]))
+    pr1 = create_purchase_request({"현장": s[2], "품명": "GPU 워크스테이션", "규격": "RTX 6000 Ada, 128GB", "계정과목": "비품",
+                                   "수량": 2, "예상단가": 6800000, "필요일": now + timedelta(days=30),
+                                   "구매사유": "신규 시뮬레이션 과제 착수. 기존 워크스테이션은 모두 사용 중"}, who("박민수", s[2]))
+    pr_decide(pr1, True, "현장 필요성 확인", who("현장책임자", s[2]))  # 다음: 자산관리자
+    create_purchase_request({"현장": s[1], "품명": "무선 바코드 스캐너", "규격": "Zebra DS2278", "계정과목": "소모품",
+                             "수량": 2, "예상단가": 450000, "필요일": now + timedelta(days=10),
+                             "구매사유": "재물조사·입고 검수용 스캐너 추가"}, who("정담당", s[1]))  # 현장책임자 전결 대기
     pr2 = create_purchase_request({"현장": s[3], "품명": "드론 측량 장비", "규격": "DJI Matrice 350 RTK", "계정과목": "공기구비품",
                                    "수량": 1, "예상단가": 12000000, "구매사유": "토공량 측정 주기 단축"}, who("최동훈", s[3]))
-    pr_decide(pr2, True, "예산 범위 내", adm)
+    while get_request("pr", pr2)["상태"] == "요청":
+        pr_decide(pr2, True, "예산 범위 내", adm)
     pr_save_quotes(pr2, [{"업체": "에어로텍", "단가": 11850000, "조건": "교육 포함"},
                          {"업체": "스카이맵", "단가": 12300000, "조건": "보증 2년"},
                          {"업체": "드론원", "단가": 11600000, "조건": "납기 3주"}], adm)
     pr_choose_vendor(pr2, 3, "최저가, 납기 허용 범위", adm)
-    idle_laptop = next((a for a in active if a["상태"] == "유휴" and a["품명"] == "노트북" and a["현장"] != s[2]), None)
+    idle_laptop = next((a for a in active if a["상태"] == "유휴" and a["품명"] == "노트북" and a["현장"] == s[1]), None)
     if idle_laptop:
         create_transfer([idle_laptop["태그번호"]], s[2], "설계팀", "서지수", "신규 입사자 지급용. 유휴 노트북 재배치 요청", who("박민수", s[2]))
     station = next((a for a in active if a["품명"] == "토탈스테이션" and a["상태"] == "사용중"), None)
@@ -1822,12 +2354,21 @@ def create_sample_data(actor: str = "예시", active_count: int = 20500, closed_
     if old:
         dsp = create_disposal([a["태그번호"] for a in old], "내용연수 만료", "매각", "배터리 노후, 성능 저하", who("김지현", s[0]))
         disposal_decide(dsp[0], True, "중고 매각 후 잔존가치 회수", adm)
+        dsp_save_bids(dsp[0], [{"매수자": "(주)리셀코리아", "금액": 450000, "조건": "일괄 매입"},
+                               {"매수자": "서울중고장비", "금액": 380000, "조건": "현장 수거"}], adm)
+    old2 = [get_asset(a["태그번호"]) for a in active if a["품명"] in ("데스크탑 PC", "회의실 프로젝터") and a["현장"] == s[1] and a["상태"] == "사용중"]
+    old2 = [a for a in old2 if a and (life_remaining_months(a) or 1) <= 0][:4]
+    if old2:  # 위원회 심의 중 (찬성 1표)
+        dsp2 = create_disposal([a["태그번호"] for a in old2], "내용연수 만료", "폐기", "부품 단종으로 수리 불가", who("정담당", s[1]))
+        cast_votes(dsp2[0], [{"위원": "finance", "위원명": "최재무", "결과": "찬성", "의견": "장부가 1,000원, 폐기 타당"}], adm)
     no = start_audit(f"{now.year} 하반기 정기 재물조사", now - timedelta(days=3), "전체", adm)
     items = get_audit_items(no)
     rnd.shuffle(items)
     marks = {r["태그번호"]: {"결과": "미발견" if i % 97 == 5 else "확인", "유휴": i % 61 == 9}
              for i, r in enumerate(items[: int(len(items) * 0.6)])}
     _bulk_audit_mark(no, marks, adm)
+    import auth
+    auth.seed_demo_users()
     report(1.0, "완료")
     return {"active": len(active), "closed": len(closed), "dsp": len(dsp_rows)}
 
@@ -1843,20 +2384,96 @@ def _bulk_audit_mark(audit_no: str, marks: dict[str, dict], actor: str):
 
 
 def clear_sample_data() -> int:
-    """[예시] 자산과 그 자산이 들어간 요청·조사·이력을 지웁니다."""
+    """[예시] 자산과 그 자산이 들어간 요청·조사·이력, 예시 직원·업체·예산·점검·라이선스·렌탈·대여·체험 계정을 지웁니다."""
     like = "%[예시]%"
+    sample_tags = 'SELECT "태그번호" FROM assets WHERE "비고" LIKE ?'
     with _lock:
         n = scalar('SELECT COUNT(*) FROM assets WHERE "비고" LIKE ?', (like,)) or 0
         conn = _db()
+        att = query("attachments", f'"대상"=\'asset\' AND "대상번호" IN ({sample_tags})', (like,))
         with conn:
-            conn.execute('DELETE FROM history WHERE "처리자" LIKE ? OR "태그번호" IN (SELECT "태그번호" FROM assets WHERE "비고" LIKE ?)', (like, like))
+            conn.execute(f'DELETE FROM history WHERE "처리자" LIKE ? OR "태그번호" IN ({sample_tags})', (like, like))
             conn.execute('DELETE FROM audit_items WHERE "회차번호" IN (SELECT "회차번호" FROM audits WHERE "시작자" LIKE ?) '
-                         'OR "태그번호" IN (SELECT "태그번호" FROM assets WHERE "비고" LIKE ?)', (like, like))
+                         f'OR "태그번호" IN ({sample_tags})', (like, like))
             conn.execute('DELETE FROM audits WHERE "시작자" LIKE ?', (like,))
+            conn.execute('DELETE FROM dsp_votes WHERE "요청번호" IN (SELECT "요청번호" FROM dsp WHERE "처리이력" LIKE ?)', (like,))
             for kind in REQUEST_TABLES:
                 conn.execute(f'DELETE FROM {kind} WHERE "처리이력" LIKE ?', (like,))
+            conn.execute(f'DELETE FROM maint_logs WHERE "등록자" LIKE ? OR "태그번호" IN ({sample_tags})', (like, like))
+            conn.execute(f'DELETE FROM maint_plans WHERE "비고" LIKE ? OR "태그번호" IN ({sample_tags})', (like, like))
+            conn.execute(f'DELETE FROM capex WHERE "등록자" LIKE ? OR "태그번호" IN ({sample_tags})', (like, like))
+            conn.execute(f'DELETE FROM rentals WHERE "처리이력" LIKE ? OR "태그번호" IN ({sample_tags})', (like, like))
+            conn.execute('DELETE FROM license_assign WHERE "라이선스번호" IN (SELECT "라이선스번호" FROM licenses WHERE "비고" LIKE ?)', (like,))
+            conn.execute(f'DELETE FROM return_items WHERE "회수번호" IN (SELECT "회수번호" FROM returns WHERE "생성자" LIKE ?) OR "태그번호" IN ({sample_tags})', (like, like))
+            conn.execute('DELETE FROM returns WHERE "생성자" LIKE ?', (like,))
+            for table in ("licenses", "leases", "employees", "vendors", "budgets", "users"):
+                conn.execute(f'DELETE FROM {table} WHERE "비고" LIKE ?', (like,))
+            conn.execute(f'DELETE FROM attachments WHERE "대상"=\'asset\' AND "대상번호" IN ({sample_tags})', (like,))
             conn.execute('DELETE FROM assets WHERE "비고" LIKE ?', (like,))
-        for t in ["assets", "audits"] + REQUEST_TABLES:
-            _invalidate(t)
+        for r in att:
+            f = DATA_DIR / "attachments" / r["저장명"]
+            if f.exists():
+                f.unlink()
+        for t in list(TABLES):
+            if TABLES[t]["cache"]:
+                _invalidate(t)
         conn.execute("VACUUM")
     return n
+
+
+# =========================================================
+# 현장 이름 바꾸기
+# =========================================================
+def rename_site(old: str, new: str, actor: str) -> int:
+    """현장 이름을 바꾸고 자산·요청·재물조사에 남은 이름도 함께 바꿉니다. 바뀐 자산 수를 돌려줍니다."""
+    old, new = clean_str(old), clean_str(new)
+    if not new:
+        raise DataError("새 현장 이름을 입력하세요.")
+    if old not in site_names():
+        raise DataError(f"'{old}' 현장을 찾을 수 없습니다.")
+    if new in site_names():
+        raise DataError(f"'{new}' 현장이 이미 있습니다.")
+    with _lock:
+        conn = _db()
+        with conn:
+            conn.execute('UPDATE sites SET "현장명"=? WHERE "현장명"=?', (new, old))
+            n = conn.execute('UPDATE assets SET "현장"=? WHERE "현장"=?', (new, old)).rowcount
+            for table, cols in (("pr", ["현장"]), ("inc", ["현장"]), ("dsp", ["현장"]),
+                                ("move", ["보내는 현장", "받는 현장"]), ("audit_items", ["현장"])):
+                for c in cols:
+                    conn.execute(f'UPDATE {table} SET {_q(c)}=? WHERE {_q(c)}=?', (new, old))
+            conn.execute('UPDATE audits SET "대상"=? WHERE "대상"=?', (new, old))
+        for t in ["sites", "assets", "audits"] + REQUEST_TABLES:
+            _invalidate(t)
+    add_history("-", "현장 이름 변경", f"{old} → {new} (자산 {n:,}개)", actor)
+    return n
+
+
+# =========================================================
+# 공개 데모 / 테스트 지원
+# =========================================================
+def seed_demo_if_empty() -> bool:
+    """인터넷 공개 데모에서 처음 들어온 사람이 빈 화면을 보지 않도록 체험용 예시 데이터를 한 번 만듭니다."""
+    if not ON_CLOUD:
+        return False
+    with _lock:
+        if scalar("SELECT v FROM _meta WHERE k='demo_seeded'") or scalar("SELECT 1 FROM assets LIMIT 1"):
+            return False
+        create_sample_data("데모", active_count=DEMO_SAMPLE[0], closed_count=DEMO_SAMPLE[1])
+        with _db() as conn:
+            conn.execute("INSERT OR REPLACE INTO _meta VALUES ('demo_seeded', ?)", (now_text(),))
+    return True
+
+
+def use_data_dir(path) -> None:
+    """저장 위치를 바꿉니다(테스트에서 임시 폴더를 쓸 때)."""
+    global DATA_DIR, DB_FILE, _conn
+    with _lock:
+        if _conn is not None:
+            _conn.close()
+        _conn = None
+        DATA_DIR = Path(path)
+        DB_FILE = DATA_DIR / "자산관리.db"
+        _cache.clear()
+        _derived.clear()
+        _ver_bump.clear()

@@ -1,96 +1,176 @@
 """
-현장 담당자 페이지 + QR 스캔 화면
+현장 · 직원 화면 + QR 스캔 화면
 
-법인차량 관리 AI의 사용자 페이지처럼 이름을 입력해 사용합니다.
-현장 담당자는 자기 현장 자산을 보유·관리하고, 다른 현장 자산이 필요하면 이동을 신청합니다.
+- 현장 홈 (현장책임자·현장담당): 우리 현장 KPI, 처리할 일, 알림, 신청 현황
+- 내 자산 (모든 사용자): 내가 쓰는 자산·라이선스, 내 대여, 내가 낸 신청
+- AI 요청·신청서: 자연어 요청 → 유휴 자산 재배치 / 구매요청 / 경위서 / 처분 신청
+- QR 화면 (?tag=태그번호): 사용자를 고르기 전에는 기본 정보만, 고르면 상세·조사 확인·신고
 """
 from __future__ import annotations
 
 import html
-from datetime import date
 
 import pandas as pd
 import streamlit as st
 
 import ai
+import auth
 import data as d
+import ops
 import ui
 import workflow as wf
+from auth import ADMIN, SITE_ROLES, STAFF
 
 
-def render(site: str, name: str):
-    actor = f"{name}({site})" if name else ""
-    st.title(f"👤 {site} 자산관리")
-    st.caption("우리 현장 자산을 관리하고, 필요한 자산은 구매요청이나 다른 현장 유휴 자산 이동으로 신청합니다.")
-    if not name:
-        st.info("왼쪽에서 담당 현장을 고르고 이름을 입력하세요. 이름이 있어야 신청·승인·검수를 할 수 있습니다.")
-
+# ---------------------------------------------------------
+# 현장 홈
+# ---------------------------------------------------------
+def site_home(u: dict):
+    site = u["현장"]
+    st.title(f"👷 {site} 자산관리")
+    st.caption(f"{u['이름']}님({u['역할']}) · 우리 현장 자산을 관리하고, 필요한 자산은 다른 현장 유휴 자산 이동이나 구매요청으로 신청합니다.")
     mine = d.get_assets(site, include_closed=False)
-    pending = wf.pending_for(wf.SITE, site) if name else {k: [] for k in d.REQUEST_TABLES}
+    pending = wf.pending_for(u)
+    rentals = wf.pending_rentals(u)
     todo = [(k, r) for k in d.REQUEST_TABLES for r in pending[k]]
+    alerts = ops.alerts_for(u, pending)
 
-    k = st.columns(5)
-    with k[0]: ui.kpi("보유 자산", len(mine), site, unit="개")
+    k = st.columns(6)
+    with k[0]: ui.kpi("보유 자산", f"{len(mine):,}", site, unit="개")
     with k[1]: ui.kpi("장부가액", ui.short_won(sum(d.book_value(a) for a in mine)), "오늘 기준", unit="원")
-    with k[2]: ui.kpi("유휴", sum(1 for a in mine if a["상태"] == "유휴"), "다른 현장에 재배치 가능", "warn" if any(a["상태"] == "유휴" for a in mine) else "", "개")
+    idle = sum(1 for a in mine if a["상태"] == "유휴")
+    with k[2]: ui.kpi("유휴", idle, "다른 현장에 재배치 가능", "warn" if idle else "", "개")
     with k[3]: ui.kpi("내용연수 만료", sum(1 for a in mine if (d.life_remaining_months(a) or 1) <= 0), "처분 검토", unit="개")
-    with k[4]: ui.kpi("내 처리 대기", len(todo), "이동 승인·인수·검수·집행", "warn" if todo else "", "건")
+    with k[4]: ui.kpi("내 처리 대기", len(todo) + len(rentals), "결재·인수·검수·경위서·대여", "warn" if todo or rentals else "", "건")
+    with k[5]: ui.kpi("예산 잔액", ui.short_won(ops.budget_status(d.today().year, site)[0]["잔액"]), f"{d.today().year}년 · 결재 중 포함", unit="원")
 
-    if todo:
-        st.markdown("### 🔔 처리할 일")
-        for kind, rec in todo:
-            wf.render_request_card(kind, rec, wf.SITE, site, actor, key="todo")
+    if todo or rentals:
+        st.markdown("### 📌 처리할 일")
+        for kind, rec in todo[:30]:
+            wf.render_request_card(kind, rec, u, key="todo")
+        if rentals:
+            import pages_ops
+            pages_ops.rental_cards(rentals, u, key="todo-rt")
+    else:
+        st.success("지금 처리할 결재·인수·검수가 없습니다.")
 
-    audit = d.open_audit()
-    tab_names = ["🤖 AI 요청", "📦 우리 현장 자산", "🔄 다른 현장 유휴 자산", "📝 신청서 작성", "📋 신청 현황", "🗑 처분 이력"]
-    if audit and (audit["대상"] in ("전체", site)):
-        tab_names.append("🔍 재물조사")
-    tabs = st.tabs(tab_names)
+    tabs = st.tabs([f"🔔 알림 ({len(alerts)})", "📋 신청 현황", "🗑 처분 이력"])
     with tabs[0]:
-        ai_tab(site, actor)
+        ui.alert_list(alerts, key="site-alert", limit=30)
     with tabs[1]:
-        my_assets_tab(site, actor, mine)
+        st.caption("우리 현장과 관련된 모든 요청입니다. 처리할 차례가 되면 위 '처리할 일'에 나타납니다.")
+        icons = {"pr": "🛒", "move": "🔄", "inc": "⚠️", "dsp": "🗑"}
+        sub = st.tabs([f"{icons[k]} {d.KIND_NAMES[k]}" for k in d.REQUEST_TABLES])
+        for tab, kind in zip(sub, d.REQUEST_TABLES):
+            with tab:
+                wf.render_request_list(kind, u, key=f"status-{kind}", scope_site=site)
     with tabs[2]:
-        idle_tab(site, actor)
-    with tabs[3]:
-        forms_tab(site, actor, mine)
-    with tabs[4]:
-        status_tab(site, actor)
-    with tabs[5]:
         st.caption(f"{site}에서 폐기·매각·기증·경매·망실로 장부에서 빠진 자산입니다.")
-        wf.render_disposed_list(f"site-disposed-{site}", actor, wf.SITE, site)
-    if len(tabs) > 6:
-        with tabs[6]:
-            if not name:
-                st.info("이름을 입력하면 재물조사 결과를 입력할 수 있습니다.")
-            else:
-                wf.render_audit_workspace(audit, wf.SITE, site, actor, key=f"site-audit-{site}")
+        wf.render_disposed_list(f"site-disposed-{site}", u, site)
 
 
 # ---------------------------------------------------------
-# AI 요청
+# 내 자산 (모든 사용자)
 # ---------------------------------------------------------
-def ai_tab(site: str, actor: str):
-    st.markdown("### 🤖 AI 자연어 자산 요청")
-    st.caption("Ollama가 요청을 분석하고 Python이 다시 확인합니다. 새로 사기 전에 다른 현장의 유휴 자산부터 찾아 드립니다.")
-    if not actor:
-        st.warning("먼저 왼쪽에서 이름을 입력하세요.")
+def my_assets(u: dict) -> list[dict]:
+    name, site = u.get("이름"), u.get("현장")
+    emp_nos = {e["사번"] for e in ops.get_employees() if e["이름"] == name and (not site or e["현장"] == site)}
+    return [a for a in d.active_assets() if (a["사용자사번"] and a["사용자사번"] in emp_nos)
+            or (not a["사용자사번"] and a["사용자"] == name and (not site or a["현장"] == site))]
+
+
+def my_requests(u: dict) -> list[tuple[str, dict]]:
+    me = auth.actor(u)
+    return [(k, r) for k in d.REQUEST_TABLES for r in d.get_requests(k)
+            if me in (r.get("요청자"), r.get("신고자"), r.get("신청자"))]
+
+
+def my_page(u: dict):
+    st.title("🙋 내 자산")
+    st.caption("내가 쓰는 회사 자산과 소프트웨어, 빌린 공용 장비, 내가 낸 신청을 한 곳에서 봅니다. "
+               "잃어버리거나 고장 나면 자산을 골라 '상세 · 신고'에서 바로 신고하세요.")
+    assets = my_assets(u)
+    lic = [x for x in d.load("license_assign") if x["상태"] == "사용중" and x["사용자"] == u["이름"]
+           and (not u.get("현장") or not x["현장"] or x["현장"] == u["현장"])]
+    rentals = [r for r in d.load("rentals") if r["신청자"] == u["아이디"]]
+    reqs = my_requests(u)
+    k = st.columns(4)
+    with k[0]: ui.kpi("내 자산", len(assets), "내가 사용자로 등록된 자산", unit="개")
+    with k[1]: ui.kpi("소프트웨어", len(lic), "할당된 라이선스", unit="개")
+    open_r = [r for r in rentals if r["상태"] in ops.RENTAL_OPEN]
+    with k[2]: ui.kpi("대여 중·예약", len(open_r), "공용 장비", "warn" if any(r["상태"] == "대여중" for r in open_r) else "", "건")
+    with k[3]: ui.kpi("진행 중인 신청", sum(1 for kd, r in reqs if d.is_open(kd, r)), f"전체 {len(reqs)}건", unit="건")
+
+    tabs = st.tabs(["💻 내 자산", "🧰 내 대여", "📝 내 신청", "🛒 구매 요청하기"])
+    with tabs[0]:
+        if not assets:
+            st.info("내 이름으로 등록된 자산이 없습니다. 받은 장비가 목록에 없으면 현장 담당자에게 알려 주세요.")
+        else:
+            df = ui.asset_frame(assets)
+            ev = st.dataframe(df, hide_index=True, width="stretch", column_config=ui.ASSET_COLUMN_CONFIG,
+                              on_select="rerun", selection_mode="single-row", key="my-assets-table")
+            sel = [df.iloc[i]["태그번호"] for i in ev.selection.rows if i < len(df)]
+            if st.button("🔍 상세 · 신고", disabled=not sel, key="my-asset-detail"):
+                wf.asset_dialog(sel[0], u)
+        if lic:
+            st.markdown("**💿 내 소프트웨어**")
+            st.dataframe(pd.DataFrame([{"소프트웨어": (d.lookup("licenses", x["라이선스번호"]) or {}).get("소프트웨어명", ""),
+                                        "설치 PC": x["PC태그"], "할당일": x["할당일"]} for x in lic]), hide_index=True, width="stretch")
+    with tabs[1]:
+        import pages_ops
+        if not rentals:
+            st.info("빌린 장비가 없습니다. '🧰 장비 대여' 메뉴에서 공용 장비를 빌릴 수 있습니다.")
+        else:
+            pages_ops.rental_cards(sorted(rentals, key=lambda r: r["신청일시"], reverse=True)[:30], u, key="my-rt")
+    with tabs[2]:
+        if not reqs:
+            st.info("낸 신청이 없습니다.")
+        for kind, rec in sorted(reqs, key=lambda kr: kr[1]["요청일시"], reverse=True)[:40]:
+            wf.render_request_card(kind, rec, u, key="my-req")
+    with tabs[3]:
+        if not u.get("현장"):
+            st.info("소속 현장이 없는 계정은 결재함의 '구매요청 작성'을 이용하세요.")
+        else:
+            wf.purchase_form("my-pr", [u["현장"]], u, defaults={"현장": u["현장"]})
+
+
+# ---------------------------------------------------------
+# AI 요청 · 신청서
+# ---------------------------------------------------------
+def request_page(u: dict):
+    st.title("🤖 AI 요청 · 신청서")
+    if u.get("역할") == ADMIN or not u.get("현장"):
+        sites = d.site_names()
+        site = st.selectbox("요청 현장", sites, key="req-site") if sites else None
+    else:
+        site = u["현장"]
+    if not site:
+        st.warning("등록된 현장이 없습니다.")
         return
+    tabs = st.tabs(["🤖 AI 자연어 요청", "📝 신청서 직접 작성"])
+    with tabs[0]:
+        ai_tab(site, u)
+    with tabs[1]:
+        forms_tab(site, u)
+
+
+def ai_tab(site: str, u: dict):
+    st.caption("Ollama가 요청을 분석하고 Python이 다시 확인합니다. 새로 사기 전에 다른 현장의 유휴 자산부터 찾아 드립니다.")
     example = "다음주까지 신규 입사자 2명이 쓸 노트북 2대가 필요해. 한 대에 180만원 정도로 생각하고 있어"
     text = st.text_area("요청을 자연어로 입력하세요", height=100, placeholder=example, key="ai_text")
     c1, c2 = st.columns([3, 1])
-    use_ollama = c2.toggle("Ollama 사용", value=True, key="ai_use_ollama", help="끄면 규칙 기반으로 바로 분석합니다")
+    use_ollama = c2.toggle("Ollama 사용", value=not d.ON_CLOUD, key="ai_use_ollama", help="끄면 규칙 기반으로 바로 분석합니다")
     if c1.button("🤖 AI 분석하기", type="primary", width="stretch"):
         if not text.strip():
             st.warning("요청 내용을 입력하세요.")
         else:
             with st.spinner("요청을 분석하고 있습니다..."):
                 result, source, note = ai.analyze(text, site, use_ollama)
-            st.session_state["ai_result"] = {"result": result, "source": source, "note": note, "text": text}
+            st.session_state["ai_result"] = {"result": result, "source": source, "note": note, "text": text, "site": site}
             st.rerun()
 
     saved = st.session_state.get("ai_result")
-    if not saved:
+    if not saved or saved.get("site") != site:
         st.caption("예: '평택 현장 지게차가 부족해서 다른 현장 남는 거 있으면 가져오고 싶어', 'FUR-2024-0003 노트북을 잃어버렸어', '고장난 프로젝터 폐기하고 싶어'")
         return
     r, source = saved["result"], saved["source"]
@@ -106,8 +186,9 @@ def ai_tab(site: str, actor: str):
     m[4].metric("필요 시점", ui.fmt_date(r["needed_by"]))
     m[5].metric("계정과목", r["account"])
 
+    staff = u.get("역할") == STAFF
     others = [a for a in d.active_assets() if a["현장"] != site]
-    mine = d.get_assets(site, include_closed=False)
+    mine = my_assets(u) if staff else d.get_assets(site, include_closed=False)
     intent = r["intent"]
 
     if intent in ("purchase", "transfer", "search"):
@@ -120,121 +201,67 @@ def ai_tab(site: str, actor: str):
             st.success(f"다른 현장에 {'유휴 ' if idle_hits else ''}'{r['item']}' {len(hits)}개가 있습니다." +
                        (f" 재배치하면 약 {ui.won(saving)}의 구매 비용을 줄일 수 있습니다." if idle_hits and r["unit_price"] else ""))
             st.dataframe(ui.asset_frame(hits), hide_index=True, width="stretch", column_config=ui.ASSET_COLUMN_CONFIG)
-            st.markdown("### ③ 이동 신청")
-            wf.transfer_form("ai-transfer", hits, [site], actor, preselected=[a["태그번호"] for a in idle_hits[: r["qty"]]], default_to=site)
+            if staff:
+                st.caption("이동 신청은 현장 담당자가 합니다. 담당자에게 위 자산을 알려 주세요.")
+            else:
+                st.markdown("### ③ 이동 신청")
+                wf.transfer_form("ai-transfer", hits, [site], u, preselected=[a["태그번호"] for a in idle_hits[: r["qty"]]], default_to=site)
         else:
             st.caption(f"다른 현장에 재배치할 수 있는 유휴 '{r['item'] or '자산'}'이(가) 없습니다.")
         if intent == "purchase" or not hits:
-            st.markdown(f"### {'④' if hits else '③'} 구매요청서 (AI가 미리 채움)")
-            wf.purchase_form("ai-pr", [site], actor, defaults={
+            st.markdown(f"### {'④' if hits and not staff else '③'} 구매요청서 (AI가 미리 채움)")
+            wf.purchase_form("ai-pr", [site], u, defaults={
                 "현장": site, "계정과목": r["account"], "품명": r["item"], "규격": r["spec"], "수량": r["qty"],
                 "예상단가": r["unit_price"], "필요일": r["needed_by"], "구매사유": r["reason"]})
     elif intent == "incident":
         st.markdown("### ② 대상 자산 확인")
         hits = ai.match_assets(mine, r["item"], r["tags"]) or mine
-        st.caption("우리 현장 자산 중 요청과 맞는 자산을 먼저 보여 줍니다. 다르면 목록에서 바꾸세요.")
+        st.caption(("내 자산" if staff else "우리 현장 자산") + " 중 요청과 맞는 자산을 먼저 보여 줍니다. 다르면 목록에서 바꾸세요.")
         st.markdown("### ③ 분실·파손 경위서 (AI가 미리 채움)")
-        wf.incident_form("ai-inc", hits, actor, preselected=hits[0]["태그번호"] if hits else None,
-                         defaults={"구분": r["incident_type"], "경위": r["reason"], "발생일": date.today()})
+        wf.incident_form("ai-inc", hits, u, preselected=hits[0]["태그번호"] if hits else None,
+                         defaults={"구분": r["incident_type"], "경위": r["reason"], "발생일": d.today()})
     elif intent == "disposal":
-        st.markdown("### ② 처분 대상 확인")
-        pool = [a for a in mine if a["상태"] in ("사용중", "유휴", "수리중")]
-        hits = ai.match_assets(pool, r["item"], r["tags"]) or pool
-        st.markdown("### ③ 처분 신청")
-        wf.disposal_form("ai-dsp", hits, actor, preselected=[a["태그번호"] for a in hits[:r["qty"]]] if ai.match_assets(pool, r["item"], r["tags"]) else [])
+        if staff:
+            st.info("처분 신청은 현장 담당자가 합니다. 고장이라면 '분실·파손 신고'로 알려 주세요.")
+        else:
+            st.markdown("### ② 처분 대상 확인")
+            pool = [a for a in mine if a["상태"] in ("사용중", "유휴", "수리중")]
+            matched = ai.match_assets(pool, r["item"], r["tags"])
+            st.markdown("### ③ 처분 신청")
+            wf.disposal_form("ai-dsp", matched or pool, u, preselected=[a["태그번호"] for a in matched[:r["qty"]]])
     if st.button("다시 입력", key="ai-reset"):
         st.session_state.pop("ai_result", None)
         st.rerun()
 
 
-# ---------------------------------------------------------
-# 우리 현장 자산
-# ---------------------------------------------------------
-def my_assets_tab(site: str, actor: str, mine: list[dict]):
-    c1, c2 = st.columns([2, 1])
-    query = c1.text_input("검색", placeholder="태그번호·품명·사용자", key="my-q").strip().lower()
-    status = c2.selectbox("상태", ["전체"] + [s for s in d.ASSET_STATUSES if s not in d.CLOSED_STATUSES], key="my-status")
-    rows = [a for a in mine if (status == "전체" or a["상태"] == status)
-            and (not query or any(query in str(a[k]).lower() for k in ("태그번호", "품명", "규격", "사용자", "관리부서")))]
-    if not rows:
-        st.info("우리 현장에 해당하는 자산이 없습니다.")
-        return
-    page = ui.paginate(rows, f"my-page-{site}-{status}-{query}")
-    df = ui.asset_frame(page)
-    ev = st.dataframe(df, hide_index=True, width="stretch", column_config=ui.ASSET_COLUMN_CONFIG,
-                      on_select="rerun", selection_mode="multi-row", key=f"my-table-{site}")
-    sel = [df.iloc[i]["태그번호"] for i in ev.selection.rows if i < len(df)]
-    c1, c2 = st.columns(2)
-    if c1.button("🔍 상세 · 작업", disabled=len(sel) != 1, width="stretch", key="my-detail"):
-        wf.asset_dialog(sel[0], wf.SITE, site, actor)
-    with c2:
-        targets = [a for a in page if a["태그번호"] in sel] or rows
-        if st.button(f"🏷️ QR 라벨 ({len(targets):,}개)", width="stretch", key="my-label"):
-            st.session_state["my_label_tags"] = [a["태그번호"] for a in targets]
-        if st.session_state.get("my_label_tags"):
-            ui.label_download([a for a in (d.get_asset(t) for t in st.session_state["my_label_tags"]) if a], key="my-label-dl", label="⬇️ 라벨 PDF 받기")
-    export_cols = ui.ASSET_VIEW_COLS + ["시리얼번호", "공급업체", "비고"]
-    ui.export_panel(f"my-export-{site}", f"{site}_자산_{date.today():%Y%m%d}",
-                    lambda: {site: (export_cols, [{**a, "장부가액": round(d.book_value(a))} for a in rows])}, len(rows))
-
-
-def idle_tab(site: str, actor: str):
-    st.caption("다른 현장에서 쓰지 않는 자산입니다. 필요하면 이동을 신청하세요. 보내는 현장이 승인하면 받아서 인수확인합니다.")
-    idle = [a for a in d.active_assets() if a["상태"] == "유휴" and a["현장"] != site]
-    if not idle:
-        st.success("지금은 다른 현장의 유휴 자산이 없습니다.")
-        return
-    c1, c2 = st.columns(2)
-    acc = c1.selectbox("계정과목", ["전체"] + d.ACCOUNT_NAMES, key="idle-acc")
-    q = c2.text_input("검색", placeholder="품명·규격", key="idle-q").strip().lower()
-    idle = [a for a in idle if (acc == "전체" or a["계정과목"] == acc) and (not q or q in a["품명"].lower() or q in a["규격"].lower())]
-    if not idle:
-        st.info("조건에 맞는 유휴 자산이 없습니다.")
-        return
-    page = ui.paginate(idle, f"idle-page-{acc}-{q}", page_size=500)
-    df = ui.asset_frame(page)
-    ev = st.dataframe(df, hide_index=True, width="stretch", column_config=ui.ASSET_COLUMN_CONFIG,
-                      on_select="rerun", selection_mode="multi-row", key=f"idle-others-{acc}-{q}")
-    sel = [df.iloc[i]["태그번호"] for i in ev.selection.rows if i < len(df)]
-    if st.button(f"🔄 선택한 {len(sel)}개 우리 현장으로 이동 신청", type="primary", disabled=not sel or not actor):
-        wf.dlg_new_transfer(sel, actor, default_to=site)
-
-
-def forms_tab(site: str, actor: str, mine: list[dict]):
-    if not actor:
-        st.warning("이름을 입력하면 신청서를 작성할 수 있습니다.")
-        return
-    kind = st.radio("신청서", ["🛒 구매요청", "🔄 이동신청 (다른 현장 자산 받기)", "📤 이동신청 (우리 자산 보내기)",
-                             "⚠️ 분실·파손 신고", "🗑 처분 신청"], horizontal=True, key="form-kind")
+def forms_tab(site: str, u: dict):
+    staff = u.get("역할") == STAFF
+    if staff:
+        options = ["🛒 구매요청", "⚠️ 분실·파손 신고 (내 자산)"]
+    else:
+        options = ["🛒 구매요청", "🔄 이동신청 (다른 현장 자산 받기)", "📤 이동신청 (우리 자산 보내기)", "⚠️ 분실·파손 신고", "🗑 처분 신청"]
+    kind = st.radio("신청서", options, horizontal=True, key="form-kind")
+    mine = my_assets(u) if staff else d.get_assets(site, include_closed=False)
     if kind.startswith("🛒"):
-        wf.purchase_form("site-pr", [site], actor, defaults={"현장": site})
+        wf.purchase_form("site-pr", [site], u, defaults={"현장": site})
     elif kind.startswith("🔄"):
         others = [a for a in d.active_assets() if a["현장"] != site and a["상태"] != "처분대기"]
-        wf.transfer_form("site-mv-in", others, [site], actor, default_to=site)
+        wf.transfer_form("site-mv-in", others, [site], u, default_to=site)
     elif kind.startswith("📤"):
-        wf.transfer_form("site-mv-out", [a for a in mine if a["상태"] != "처분대기"], [s for s in d.site_names() if s != site], actor)
+        wf.transfer_form("site-mv-out", [a for a in mine if a["상태"] != "처분대기"], [s for s in d.site_names() if s != site], u)
     elif kind.startswith("⚠️"):
-        wf.incident_form("site-inc", mine, actor)
+        wf.incident_form("site-inc", mine, u)
     else:
         candidates = [a for a in mine if a["상태"] in ("사용중", "유휴", "수리중")]
         hints = d.disposal_candidates(site)
-        only = st.toggle(f"처분 검토 대상만 보기 (내용연수 만료 등 {len(hints):,}개)", value=bool(hints), key="dsp-only-hints")
-        wf.disposal_form("site-dsp", hints if only and hints else candidates, actor)
-
-
-def status_tab(site: str, actor: str):
-    st.caption("우리 현장과 관련된 모든 요청입니다. 처리할 차례가 되면 위 '처리할 일'에 나타납니다.")
-    icons = {"pr": "🛒", "move": "🔄", "inc": "⚠️", "dsp": "🗑"}
-    tabs = st.tabs([f"{icons[k]} {d.KIND_NAMES[k]}" for k in d.REQUEST_TABLES])
-    for tab, kind in zip(tabs, d.REQUEST_TABLES):
-        with tab:
-            wf.render_request_list(kind, wf.SITE, site, actor, key=f"status-{kind}", scope_site=site)
+        only = st.toggle(f"처분 검토 대상만 보기 (내용연수 만료·수리비 과다 등 {len(hints):,}개)", value=bool(hints), key="dsp-only-hints")
+        wf.disposal_form("site-dsp", hints if only and hints else candidates, u)
 
 
 # ---------------------------------------------------------
 # QR 스캔 화면 (?tag=태그번호)
 # ---------------------------------------------------------
-def qr_page(tag: str):
+def qr_page(tag: str, u: dict | None):
     a = d.get_asset(tag)
     st.title("🏷️ 자산 확인")
     if st.button("← 전체 화면으로"):
@@ -243,24 +270,34 @@ def qr_page(tag: str):
     if not a:
         st.error(f"'{tag}' 태그의 자산을 찾을 수 없습니다. 라벨의 태그번호를 확인하세요.")
         return
-    c1, c2 = st.columns(2)
-    sites = d.site_names()
-    site = c1.selectbox("내 현장", sites, index=sites.index(a["현장"]) if a["현장"] in sites else 0, key="qr_site")
-    name = c2.text_input("이름", key="qr_name", placeholder="확인·신고하려면 입력")
-    actor = f"{name}({site})" if name else ""
+    if not u:
+        # 사용자 선택 전: 습득·반납 안내에 필요한 정보만 보여 줍니다(사용자 이름·금액은 숨김).
+        site = next((s for s in d.get_sites() if s["현장명"] == a["현장"]), {})
+        company = d.clean_str(d.get_settings().get("회사명"))
+        st.markdown(f"<div class='asset-head'><span class='tag'>{html.escape(a['태그번호'])}</span>"
+                    f"<span class='name'>{html.escape(a['품명'])}</span>{ui.badge(a['상태'])}</div>", unsafe_allow_html=True)
+        st.write(f"{company + ' ' if company else ''}{a['현장']} 소속 자산입니다.")
+        if site.get("담당자 연락처"):
+            st.info(f"이 물건을 습득하셨다면 {a['현장']} 자산 담당자({site.get('담당자', '')}, {site['담당자 연락처']})에게 연락 부탁드립니다.")
+        st.caption("직원은 아래에서 본인을 고르면 상세 정보 확인, 재물조사 확인, 분실·파손 신고를 할 수 있습니다.")
+        auth.choose_screen(compact=True)
+        return
 
     audit = d.open_audit()
-    if audit and actor:
+    if audit:
         item = next((r for r in d.get_audit_items(audit["회차번호"]) if r["태그번호"] == a["태그번호"]), None)
         if item:
             with st.container(border=True):
-                st.markdown(f"**🔍 {audit['회차명']}** · 현재 결과: {ui.badge(item['결과'])}", unsafe_allow_html=True)
+                st.markdown(f"**🔍 {html.escape(audit['회차명'])}** · 현재 결과: {ui.badge(item['결과'])}", unsafe_allow_html=True)
                 if item["결과"] != "확인":
-                    if a["현장"] != site:
+                    if not wf.manages(u, a["현장"]):
                         st.caption(f"{a['현장']} 담당자가 확인할 자산입니다.")
                     elif st.button("✅ 실물 확인 처리", type="primary", width="stretch"):
-                        if ui.run_action(d.audit_mark, audit["회차번호"], {a["태그번호"]: {"결과": "확인"}}, actor,
+                        if ui.run_action(d.audit_mark, audit["회차번호"], {a["태그번호"]: {"결과": "확인"}}, auth.actor(u),
                                          success=f"{a['태그번호']} 실물 확인을 기록했습니다."):
                             st.rerun()
-    role = wf.SITE
-    wf.render_asset_detail(a["태그번호"], role, site, actor, key="qr")
+    wf.render_asset_detail(a["태그번호"], u, key="qr")
+
+
+# 다른 모듈에서 쓰는 역할 상수
+__all__ = ["site_home", "my_page", "request_page", "qr_page", "SITE_ROLES"]

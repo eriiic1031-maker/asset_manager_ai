@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import html
 import io
-from datetime import date
 from pathlib import Path
 
 import pandas as pd
@@ -36,7 +35,7 @@ def inject_css():
         .kpi-card.crit {border-color:#fca5a5;background:#fef2f2;}
         .kpi-card.ok {border-color:#86efac;background:#f0fdf4;}
         .kpi-title {font-size:14px;color:#64748b;font-weight:700;}
-        .kpi-value {font-size:28px;font-weight:800;margin-top:6px;color:#111827;font-variant-numeric:tabular-nums;}
+        .kpi-value {font-size:clamp(20px,2.1vw,28px);font-weight:800;margin-top:6px;color:#111827;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
         .kpi-value small {font-size:15px;color:#64748b;font-weight:700;margin-left:2px;}
         .kpi-caption {font-size:12px;color:#94a3b8;margin-top:4px;}
         .badge {display:inline-block;padding:4px 8px;border-radius:999px;font-size:12px;font-weight:700;white-space:nowrap;}
@@ -363,7 +362,44 @@ def label_download(assets: list[dict], key: str, label: str = "🏷️ QR 라벨
     except d.DataError as exc:
         st.error(str(exc))
         return
-    name = f"자산라벨_{assets[0]['태그번호']}.pdf" if len(assets) == 1 else f"자산라벨_{date.today():%Y%m%d}_{len(assets)}개.pdf"
+    name = f"자산라벨_{assets[0]['태그번호']}.pdf" if len(assets) == 1 else f"자산라벨_{d.today():%Y%m%d}_{len(assets)}개.pdf"
     st.download_button(label, pdf, file_name=name, mime="application/pdf", key=key, width="stretch")
     if not korean_font_available():
         st.caption("※ 한글 글꼴을 찾지 못해 라벨의 한글이 깨질 수 있습니다. 맑은 고딕(Windows)이 있으면 자동으로 사용합니다.")
+
+
+# =========================================================
+# 페이지 이동 (app.py가 st.navigation 페이지를 여기에 등록합니다)
+# =========================================================
+PAGES: dict = {}
+
+
+def goto(name: str):
+    """등록된 페이지로 이동합니다. 권한이 없어 메뉴에 없는 페이지면 아무것도 하지 않습니다."""
+    page = PAGES.get(name)
+    if page is not None:
+        st.switch_page(page)
+
+
+def page_button(label: str, name: str, key: str, **kwargs):
+    if name in PAGES and st.button(label, key=key, **kwargs):
+        goto(name)
+
+
+ALERT_ICON = {"crit": "🔴", "warn": "🟡", "info": "🔵"}
+
+
+def alert_list(alerts: list[dict], key: str, limit: int = 50):
+    """알림 목록(심각도 아이콘 · 분류 · 제목 · 내용 · 바로가기)."""
+    if not alerts:
+        st.success("확인할 알림이 없습니다.")
+        return
+    for i, a in enumerate(alerts[:limit]):
+        c1, c2 = st.columns([6, 1])
+        c1.markdown(f"{ALERT_ICON[a['심각도']]} **[{html.escape(a['분류'])}]** {html.escape(a['제목'])}"
+                    + (f" <span class='small-muted'>· {html.escape(str(a['내용']))}</span>" if a["내용"] else ""),
+                    unsafe_allow_html=True)
+        if a.get("메뉴") in PAGES and c2.button("이동", key=f"{key}-{i}", width="stretch"):
+            goto(a["메뉴"])
+    if len(alerts) > limit:
+        st.caption(f"… 외 {len(alerts) - limit}건")
