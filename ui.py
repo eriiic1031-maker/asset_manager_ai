@@ -29,7 +29,7 @@ def inject_css():
     st.markdown(
         """
         <style>
-        .block-container {padding-top: 1.2rem; padding-bottom: 2rem;}
+        .block-container {padding-top: 4rem; padding-bottom: 2rem;}  /* 위쪽 상단 바(Share·⋮)에 첫 줄이 가리지 않게 */
         .kpi-card {border:1px solid #e6e8eb;border-radius:16px;padding:16px 18px;background:#fff;box-shadow:0 2px 10px rgba(0,0,0,.04);min-height:115px;}
         .kpi-card.warn {border-color:#fcd34d;background:#fffbeb;}
         .kpi-card.crit {border-color:#fca5a5;background:#fef2f2;}

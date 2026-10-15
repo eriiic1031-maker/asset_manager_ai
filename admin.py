@@ -818,8 +818,9 @@ def settings_data(u: dict):
     st.markdown("#### 💾 데이터 내보내기 · 백업")
     st.caption(f"데이터는 {d.DB_FILE.parent.name}/{d.DB_FILE.name} 한 파일(SQLite)에 저장되고, 첨부파일은 data/attachments 폴더에 저장됩니다. "
                "엑셀이 필요하면 아래에서 표를 골라 내보내세요.")
-    labels = {t: f"{spec['label']} ({d.table_count(t):,}행)" for t, spec in d.TABLES.items()}
+    labels = {t: spec["label"] for t, spec in d.TABLES.items()}
     table = st.selectbox("내보낼 표", list(labels), format_func=lambda t: labels[t], key="export-table")
+    st.caption(f"{labels[table]}: 지금 {d.table_count(table):,}행")
     cols = list(d.TABLES[table]["cols"])
     ui.export_panel(f"table-export-{table}", f"{d.TABLES[table]['label']}_{d.today():%Y%m%d}",
                     lambda: {d.TABLES[table]["label"]: (cols, d.table_rows(table))}, d.table_count(table))
@@ -836,19 +837,10 @@ def settings_data(u: dict):
 
     st.markdown("#### 🧪 예시 데이터")
     c1, c2 = st.columns([2, 1])
-    if ON_CLOUD:
-        c1.info("공개 데모입니다. 다른 방문자가 데이터를 많이 바꿔 놓았다면 처음 상태로 되돌릴 수 있습니다 (체험용 사용자도 다시 만들어집니다).")
-        if c2.button("🔄 데모 데이터 초기화", width="stretch"):
-            with st.spinner("데모 데이터를 다시 만드는 중입니다..."):
-                d.clear_sample_data()
-                d.create_sample_data("데모", active_count=d.DEMO_SAMPLE[0], closed_count=d.DEMO_SAMPLE[1])
-            ui.flash("데모 데이터를 처음 상태로 되돌렸습니다.")
-            st.rerun()
-        return
     if d.has_sample_data():
         c1.info(f"예시 데이터가 들어 있습니다 (보유 {sum(1 for a in d.active_assets() if d.SAMPLE_MARK in a['비고']):,}개 · "
                 f"처분 {sum(1 for a in d.closed_assets() if d.SAMPLE_MARK in a['비고']):,}개). 실제 운영 전에 삭제하세요. "
-                "체험용 사용자(김자산·박전무·최재무·이현장·정담당·한직원)도 함께 지워집니다.")
+                "체험용 사용자(박전무·최재무·이현장·정담당·한직원)도 함께 지워지고, 관리자(김재열)는 남습니다.")
         if u.get("비고") == d.SAMPLE_MARK:
             c1.warning("지금 체험용 사용자로 쓰고 있습니다. 삭제하면 사용자 선택 화면으로 돌아갑니다.")
         if c2.button("🧹 예시 데이터 삭제", width="stretch"):
@@ -859,10 +851,13 @@ def settings_data(u: dict):
                 st.rerun()
     else:
         sizes = {"작게 (체험용)": d.DEMO_SAMPLE, "크게 (대량 데이터 확인용)": d.FULL_SAMPLE}
-        size = c1.radio("예시 데이터 크기", list(sizes), index=1, horizontal=True, key="sample-size")
+        if ON_CLOUD:  # 무료 서버는 메모리가 작아 20만 건을 만들면 멈출 수 있습니다
+            sizes = {"작게 (체험용)": d.DEMO_SAMPLE}
+            c1.caption("공개 데모 서버에서는 '작게'만 만들 수 있습니다. 대량 데이터는 내 PC에서 실행해 확인하세요.")
+        size = c1.radio("예시 데이터 크기", list(sizes), index=len(sizes) - 1, horizontal=True, key="sample-size")
         active_n, closed_n = sizes[size]
         c1.caption(f"보유 자산 {active_n:,}개(현장 4곳), 처분 자산 {closed_n:,}개, 진행 중인 구매·이동·사고·처분 요청과 재물조사, "
-                   "직원·공급업체·예산·점검 계획·라이선스·렌탈·장비 대여 예시와 역할별 체험용 사용자 6명을 만듭니다. "
+                   "직원·공급업체·예산·점검 계획·라이선스·렌탈·장비 대여 예시와 역할별 체험용 사용자 5명을 만듭니다. "
                    "모든 예시에 [예시]가 붙습니다."
                    + (" 30~60초 걸립니다." if closed_n > 50000 else " 몇 초면 끝납니다."))
         if c2.button("🧪 예시 데이터 만들기", width="stretch", type="primary"):

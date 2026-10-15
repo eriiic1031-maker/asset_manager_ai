@@ -89,10 +89,22 @@ def save_user(fields: dict, actor: str, uid: str | None = None) -> str:
     return rec["아이디"]
 
 
+ADMIN_ID, ADMIN_NAME = "admin", "김재열"
+
+
 def ensure_default_admin() -> None:
-    """명부가 비어 있으면 기본 관리자 한 명을 만들어 바로 쓸 수 있게 합니다."""
-    if not has_any_user():
-        save_user({"이름": "관리자", "역할": ADMIN, "부서": "자산관리팀", "위원": "Y"}, "초기 설정")
+    """관리자(김재열)가 없으면 만듭니다. 예시 데이터를 지워도 남는 실제 관리자입니다."""
+    cur = get_user(ADMIN_ID)
+    if cur:
+        if cur["이름"] == "김자산" or cur["비고"] == d.SAMPLE_MARK:  # 이전 버전의 체험용 관리자 → 김재열로 바꿈
+            d.upsert("users", [dict(cur, 이름=ADMIN_NAME, 비고="")])
+        return
+    if any(u["역할"] == ADMIN for u in get_users(True)):
+        return
+    rec = {c: "" for c in d.TABLES["users"]["cols"]}
+    rec.update({"아이디": ADMIN_ID, "이름": ADMIN_NAME, "역할": ADMIN, "부서": "자산관리팀", "위원": "Y", "활성": "Y",
+                "생성일시": d.now_text()})
+    d.upsert("users", [rec])
 
 
 def committee_members() -> list[dict]:
@@ -105,7 +117,6 @@ def site_users(site: str, roles=SITE_ROLES) -> list[dict]:
 
 DEMO_USERS = [
     # 아이디, 이름, 역할, 현장 인덱스(None=소속 현장 없음), 부서, 위원
-    ("admin", "김자산", ADMIN, None, "자산관리팀", "Y"),
     ("exec", "박전무", EXEC, None, "경영진", "Y"),
     ("finance", "최재무", FIN, None, "재무팀", "Y"),
     ("lead", "이현장", LEAD, 1, "공무팀", ""),
@@ -115,7 +126,8 @@ DEMO_USERS = [
 
 
 def seed_demo_users() -> list[str]:
-    """체험용 사용자 6명(역할별 1명)을 만듭니다. 비고에 [예시]가 붙어 예시 데이터와 함께 지워집니다."""
+    """관리자(김재열) + 역할별 체험용 사용자 5명을 만듭니다. 체험용은 비고에 [예시]가 붙어 예시 데이터와 함께 지워집니다."""
+    ensure_default_admin()
     sites = d.site_names() or ["본사"]
     made = []
     for uid, name, role, si, dept, member in DEMO_USERS:

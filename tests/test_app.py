@@ -58,7 +58,8 @@ def run_menu(uid, key):
 def _cases():
     import app
     out = []
-    for uid, _, role, *_ in __import__("auth").DEMO_USERS:
+    import auth
+    for uid, _, role, *_ in [("admin", "", auth.ADMIN)] + auth.DEMO_USERS:
         out.append((uid, "home"))
         out += [(uid, m[1]) for m in app.MENU if role in m[5]]
     return out
@@ -66,12 +67,12 @@ def _cases():
 
 def test_choose_screen_without_login(demo_store):
     at = run_app()
-    assert any("김자산" in b.label for b in at.button)  # 비밀번호 없이 사람을 고르는 버튼
+    assert any("김재열" in b.label for b in at.button)  # 비밀번호 없이 사람을 고르는 버튼
 
 
 def test_pick_user_opens_dashboard(demo_store):
     at = run_app()
-    next(b for b in at.button if "김자산" in b.label).click().run()
+    next(b for b in at.button if "김재열" in b.label).click().run()
     _ok(at)
     assert at.session_state["user_id"] == "admin"
 
